@@ -249,7 +249,7 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     let (trs, plus) = bar_rects(tabs_len, sz.0, g.scale, left);
     let hover = bar_hit(mouse, tabs_len, sz.0, g.scale, left);
     // Barra lateral: rects y textos (los buffers se reutilizan por índice, solo lo visible).
-    let mut stxt: Vec<(String, f32, f32, Color)> = vec![];
+    let mut stxt: Vec<(String, f32, f32, Color, Option<(u16, f32)>)> = vec![];
     if side.visible {
         let sc = g.scale;
         let (all, wt, wk) = sb::counts(&ents_all);
@@ -261,7 +261,10 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
         for (r, hit) in sb::layout(sz, sc, &items) {
             let (x, y, w, h) = r;
             let ty = y + (h - bm.line_height) / 2.0;
-            let mut put = |t: String, dx: f32, dy: f32, c: Color| stxt.push((t, x + dx * sc, ty + dy * sc, c));
+            // `gl` marca el próximo `put` como logo de marca (id, lado en px); el texto sale vacío.
+            let gl = std::cell::Cell::new(None);
+            let mut put = |t: String, dx: f32, dy: f32, c: Color| stxt.push((t, x + dx * sc, ty + dy * sc, c, gl.take()));
+            let logo = |a: sb::Agent, s: f32| { let ic = a.icon(); gl.set(ic.map(|(id, _)| (id, s * sc))); if ic.is_some() { String::new() } else { a.glyph().into() } };
             match hit {
                 sb::Hit::New => { rect(&mut rects, sz, x, y, w, h, BTN_BG); put("✎".into(), 10.0, 0.0, lit); put("New session".into(), 30.0, 0.0, lit); put("⇧⌘T".into(), (w - 44.0 * sc) / sc, 0.0, dimc); }
                 sb::Hit::Folder => { rect(&mut rects, sz, x, y, w, h, BTN_BG); put("▭".into(), 8.0, 0.0, dimc); }
@@ -281,7 +284,7 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
                     if e.focused { rect(&mut rects, sz, x + 6.0 * sc, y, w - 12.0 * sc, h, [0x1a, 0x1a, 0x20]); }
                     let c = e.agent.color();
                     let st = match e.status { sb::Status::Done => Color::rgb(0x5a, 0xc0, 0x6a), _ => dimc };
-                    put(e.agent.glyph().into(), 18.0, -9.0, Color::rgb(c[0], c[1], c[2]));
+                    let t = logo(e.agent, 18.0); put(t, 16.0, -9.0 + (bm.line_height / sc - 18.0) / 2.0, Color::rgb(c[0], c[1], c[2]));
                     if e.unread { put("●".into(), 8.0, -12.0, Color::rgb(0x5a, 0xc0, 0x6a)); }
                     put(e.title.clone(), 38.0, -9.0, lit);
                     put(sb::fmt_elapsed(e.secs), (w - 40.0 * sc) / sc, -9.0, dimc);
@@ -290,7 +293,7 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
                 sb::Hit::Launch(i) => {
                     let a = sb::LAUNCH[i].0;
                     let c = if side.installed[i] { a.color() } else { [0x3a, 0x3a, 0x42] };
-                    put(a.glyph().into(), 8.0, 0.0, Color::rgb(c[0], c[1], c[2]));
+                    let t = logo(a, 18.0); put(t, 6.0, (bm.line_height / sc - 18.0) / 2.0, Color::rgb(c[0], c[1], c[2]));
                 }
                 sb::Hit::Archived => { put("▤".into(), 10.0, 0.0, dimc); put("Archived".into(), 30.0, 0.0, dimc); put(side.archived.len().to_string(), (w - 24.0 * sc) / sc, 0.0, dimc); }
             }
@@ -422,11 +425,14 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     let ty = (TABBAR_H * sc - bm.line_height) / 2.0;
     let (dim_c, lit) = (Color::rgb(0x8a, 0x8a, 0x94), Color::rgb(0xd4, 0xd4, 0xd4));
     let mut bar: Vec<TextArea> = vec![];
+    let lg = |id, s: f32, dx: f32, dy: f32, c: Color| [CustomGlyph { id, left: dx, top: dy, width: s, height: s, color: Some(c), snap_to_physical_pixel: true, metadata: 0 }];
+    let tabg: Vec<[CustomGlyph; 1]> = (0..tabs.len()).map(|_| lg(0, 15.0 * sc, -18.0 * sc, (bm.line_height - 15.0 * sc) / 2.0, Color::rgb(0xd9, 0x77, 0x57))).collect();
+    let sideg: Vec<[CustomGlyph; 1]> = stxt.iter().map(|e| match e.4 { Some((id, s)) => lg(id, s, 0.0, 0.0, e.3), None => lg(u16::MAX, 0.0, 0.0, 0.0, e.3) }).collect();
     for (i, (&t, tb)) in trs.iter().zip(tabs).enumerate() {
         let col = if i == active_tab { lit } else { dim_c };
         let b = TextBounds { left: t.0 as i32, top: 0, right: (t.0 + t.2 - (CLOSE_S + 10.0) * sc) as i32, bottom: full.bottom };
-        bar.push(TextArea { buffer: &g.icons[0], left: t.0 + 10.0 * sc, top: ty, scale: 1.0, bounds: b, default_color: Color::rgb(0xd9, 0x77, 0x57), custom_glyphs: &[] });
-        bar.push(TextArea { buffer: &tb.tbuf, left: t.0 + 28.0 * sc, top: ty, scale: 1.0, bounds: b, default_color: col, custom_glyphs: &[] });
+        // Logo de Claude de la pestaña, pegado al área del título (a su izquierda).
+        bar.push(TextArea { buffer: &tb.tbuf, left: t.0 + 28.0 * sc, top: ty, scale: 1.0, bounds: b, default_color: col, custom_glyphs: &tabg[i] });
         if i == active_tab || matches!(hover, Some(BarHit::Tab(j) | BarHit::Close(j)) if j == i) {
             let c = close_rect(t, sc);
             bar.push(TextArea { buffer: &g.icons[2], left: c.0 + 4.0 * sc, top: ty, scale: 1.0, bounds: full, default_color: lit, custom_glyphs: &[] });
@@ -435,8 +441,8 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     bar.push(TextArea { buffer: &g.icons[1], left: plus.0 + 10.0 * sc, top: ty, scale: 1.0, bounds: full, default_color: dim_c, custom_glyphs: &[] });
     bar.push(TextArea { buffer: &g.icons[5], left: (BAR_LEFT + 6.0) * sc, top: ty, scale: 1.0, bounds: full, default_color: dim_c, custom_glyphs: &[] });
     let sb_bounds = TextBounds { left: 0, top: 0, right: (sb::SIDE_W * sc) as i32, bottom: g.cfg.height as i32 };
-    for ((_, x, y, c), (_, b)) in stxt.iter().zip(&g.side) {
-        bar.push(TextArea { buffer: b, left: *x, top: *y, scale: 1.0, bounds: sb_bounds, default_color: *c, custom_glyphs: &[] });
+    for (((_, x, y, c, ic), (_, b)), gl) in stxt.iter().zip(&g.side).zip(&sideg) {
+        bar.push(TextArea { buffer: b, left: *x, top: *y, scale: 1.0, bounds: sb_bounds, default_color: *c, custom_glyphs: if ic.is_some() { gl } else { &[] } });
     }
     for (k, x) in [(3, 56.0), (4, 28.0)] {
         bar.push(TextArea { buffer: &g.icons[k], left: sz.0 - x * sc, top: ty, scale: 1.0, bounds: full, default_color: dim_c, custom_glyphs: &[] });
@@ -447,7 +453,8 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
             buffer: b, left: p.rect.0 + pad, top: p.rect.1 + pad + r as f32 * ch, scale: 1.0, bounds,
             default_color: Color::rgb(0xd4, 0xd4, 0xd4), custom_glyphs: &[] })
     }));
-    g.tr.prepare(&g.device, &g.queue, &mut g.fs, &mut g.atlas, &g.vp, areas, &mut g.sc).unwrap();
+    g.tr.prepare_with_custom(&g.device, &g.queue, &mut g.fs, &mut g.atlas, &g.vp, areas, &mut g.sc,
+        |r| sb::raster_icon(r.id, r.width, r.height).map(|data| RasterizedCustomGlyph { data, content_type: ContentType::Mask })).unwrap();
     if !chips.is_empty() {
         let bounds = TextBounds { left: 0, top: 0, right: g.cfg.width as i32, bottom: g.cfg.height as i32 };
         let areas = chips.iter().map(|&[x, y, _, _]| TextArea {

@@ -17,20 +17,39 @@ pub const LAUNCH: [(Agent, &str); 6] = [
 ];
 
 impl Agent {
-    /// Glifo simple (sin logos de marca).
-    pub fn glyph(self) -> &'static str {
+    /// Glifo de texto (solo Shell; los agentes llevan logo, ver `icon`).
+    pub fn glyph(self) -> &'static str { "❯" }
+    /// (id, máscara alfa 64x64) del logo de marca; Shell no tiene.
+    pub fn icon(self) -> Option<(u16, &'static [u8])> {
+        macro_rules! m { ($i:expr, $f:literal) => { Some(($i, &include_bytes!(concat!("../assets/icons/", $f, ".a8"))[..])) } }
         match self {
-            Agent::Claude => "✻", Agent::Codex => "◎", Agent::Gemini => "✦", Agent::Grok => "⊘",
-            Agent::Opencode => "▣", Agent::Junie => "◆", Agent::Shell => "❯",
+            Agent::Claude => m!(0, "claude"), Agent::Codex => m!(1, "openai"), Agent::Gemini => m!(2, "googlegemini"),
+            Agent::Grok => m!(3, "grok"), Agent::Opencode => m!(4, "opencode"), Agent::Junie => m!(5, "jetbrains"), Agent::Shell => None,
         }
     }
     pub fn color(self) -> [u8; 3] {
         match self {
-            Agent::Claude => [0xd9, 0x77, 0x57], Agent::Codex => [0x9a, 0xa5, 0xce], Agent::Gemini => [0x7a, 0xaa, 0xff],
-            Agent::Grok => [0xd4, 0xd4, 0xd4], Agent::Opencode => [0x7a, 0xe0, 0x8a], Agent::Junie => [0xd0, 0x90, 0xf0],
-            Agent::Shell => [0x8a, 0x8a, 0x94],
+            Agent::Claude => [0xd9, 0x77, 0x57], Agent::Gemini => [0x8e, 0x75, 0xb2], Agent::Shell => [0x8a, 0x8a, 0x94],
+            _ => [0xee, 0xee, 0xee],
         }
     }
+}
+
+/// Máscara del logo `id` remuestreada (bilineal) a `w`x`h` px.
+pub fn raster_icon(id: u16, w: u16, h: u16) -> Option<Vec<u8>> {
+    let (_, src) = LAUNCH.iter().find_map(|(a, _)| a.icon().filter(|i| i.0 == id))?;
+    let at = |x: i32, y: i32| src[(y.clamp(0, 63) * 64 + x.clamp(0, 63)) as usize] as f32;
+    let mut out = Vec::with_capacity(w as usize * h as usize);
+    for j in 0..h { for i in 0..w {
+        let (fx, fy) = ((i as f32 + 0.5) * 64.0 / w as f32 - 0.5, (j as f32 + 0.5) * 64.0 / h as f32 - 0.5);
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - x0, fy - y0);
+        let (x0, y0) = (x0 as i32, y0 as i32);
+        let top = at(x0, y0) * (1.0 - tx) + at(x0 + 1, y0) * tx;
+        let bot = at(x0, y0 + 1) * (1.0 - tx) + at(x0 + 1, y0 + 1) * tx;
+        out.push((top * (1.0 - ty) + bot * ty).round() as u8);
+    } }
+    Some(out)
 }
 
 /// Agente según el nombre y la ruta del ejecutable en primer plano (Shell si no coincide).
@@ -219,6 +238,11 @@ mod tests {
         assert_eq!(clean_title("abcdef", 4), "abc…");
         assert_eq!(agent_from("2.1.5", "/x/.local/share/claude/versions/2.1.5"), Agent::Claude);
         assert_eq!(agent_from("zsh", "/bin/zsh"), Agent::Shell);
+    }
+    #[test]
+    fn logos_embebidos() {
+        for (a, _) in LAUNCH { let (id, d) = a.icon().unwrap(); assert_eq!(d.len(), 4096); assert!(d.iter().any(|&b| b > 200)); assert_eq!(raster_icon(id, 36, 36).unwrap().len(), 1296); }
+        assert!(Agent::Shell.icon().is_none());
     }
     #[test]
     fn libproc_propio() {
