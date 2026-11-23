@@ -102,20 +102,27 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 }
 
 /// Clic en (fila,col) con el cursor en otra celda de la misma línea envuelta -> flechas ←/→ para llegar.
-pub fn click_move_bytes(cursor: (usize, usize), click: (usize, usize), cols: usize) -> Vec<u8> {
+/// Con APP_CURSOR activo las flechas son `ESC O x`, si no `ESC [ x` (igual que `key_bytes`).
+pub fn click_move_bytes(cursor: (usize, usize), click: (usize, usize), cols: usize, app_cursor: bool) -> Vec<u8> {
     let d = (click.0 * cols + click.1) as isize - (cursor.0 * cols + cursor.1) as isize;
-    let arrow: &[u8] = if d < 0 { b"\x1b[D" } else { b"\x1b[C" };
+    let arrow: &[u8] = match (d < 0, app_cursor) {
+        (true, false) => b"\x1b[D", (false, false) => b"\x1b[C",
+        (true, true) => b"\x1bOD", (false, true) => b"\x1bOC",
+    };
     arrow.repeat(d.unsigned_abs())
 }
 
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
-pub struct Listener(Writer);
+pub struct Listener(Writer, Arc<Mutex<String>>);
 impl EventListener for Listener {
-    // Respuestas del terminal al programa (p. ej. posición del cursor que pide vim).
+    // Respuestas del terminal al programa (p. ej. posición del cursor que pide vim) y título (OSC 0/2).
     fn send_event(&self, e: TermEvent) {
-        if let TermEvent::PtyWrite(s) = e {
-            let _ = self.0.lock().unwrap().write_all(s.as_bytes());
+        match e {
+            TermEvent::PtyWrite(s) => { let _ = self.0.lock().unwrap().write_all(s.as_bytes()); }
+            TermEvent::Title(t) => *self.1.lock().unwrap() = t,
+            TermEvent::ResetTitle => self.1.lock().unwrap().clear(),
+            _ => {}
         }
     }
 }
@@ -129,6 +136,8 @@ impl Dimensions for Size {
 
 pub struct Session {
     pub term: Arc<Mutex<Term<Listener>>>,
+    /// Título puesto por el programa (vacío si no hay).
+    pub title: Arc<Mutex<String>>,
     writer: Writer,
     master: Box<dyn MasterPty + Send>,
 }
@@ -161,8 +170,9 @@ impl Session {
         let mut child = pair.slave.spawn_command(c).expect("spawn");
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
         let mut reader = pair.master.try_clone_reader().expect("reader");
+        let title = Arc::new(Mutex::new(String::new()));
         let config = Config { scrolling_history: SCROLLBACK, ..Config::default() };
-        let term = Arc::new(Mutex::new(Term::new(config, &Size(80, 24), Listener(writer.clone()))));
+        let term = Arc::new(Mutex::new(Term::new(config, &Size(80, 24), Listener(writer.clone(), title.clone()))));
         let t = term.clone();
         std::thread::spawn(move || {
             let mut parser: Processor = Processor::new();
@@ -175,7 +185,7 @@ impl Session {
             on_exit();
         });
         std::thread::spawn(move || { let _ = child.wait(); });
-        Self { term, writer, master: pair.master }
+        Self { term, title, writer, master: pair.master }
     }
 
     pub fn send(&self, b: &[u8]) { let _ = self.writer.lock().unwrap().write_all(b); }
@@ -214,11 +224,12 @@ mod tests {
     }
     #[test]
     fn clic_mueve_cursor() {
-        assert_eq!(click_move_bytes((0, 5), (0, 3), 10), b"\x1b[D\x1b[D".to_vec());
-        assert_eq!(click_move_bytes((0, 5), (0, 7), 10), b"\x1b[C\x1b[C".to_vec());
-        assert_eq!(click_move_bytes((0, 8), (1, 2), 10), b"\x1b[C".repeat(4));
-        assert_eq!(click_move_bytes((1, 2), (0, 8), 10), b"\x1b[D".repeat(4));
-        assert!(click_move_bytes((0, 5), (0, 5), 10).is_empty());
+        assert_eq!(click_move_bytes((0, 5), (0, 3), 10, false), b"\x1b[D\x1b[D".to_vec());
+        assert_eq!(click_move_bytes((0, 5), (0, 3), 10, true), b"\x1bOD\x1bOD".to_vec());
+        assert_eq!(click_move_bytes((0, 5), (0, 7), 10, false), b"\x1b[C\x1b[C".to_vec());
+        assert_eq!(click_move_bytes((0, 8), (1, 2), 10, false), b"\x1b[C".repeat(4));
+        assert_eq!(click_move_bytes((1, 2), (0, 8), 10, false), b"\x1b[D".repeat(4));
+        assert!(click_move_bytes((0, 5), (0, 5), 10, false).is_empty());
     }
     #[test]
     fn pegado() {
