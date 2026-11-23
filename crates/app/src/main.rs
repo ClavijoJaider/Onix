@@ -9,7 +9,7 @@ use term_core::alacritty_terminal::selection::{Selection, SelectionType};
 use term_core::alacritty_terminal::term::cell::Flags;
 use term_core::alacritty_terminal::term::TermMode;
 use term_core::alacritty_terminal::vte::ansi::{Color as AColor, CursorShape};
-use term_core::{dim, key_bytes, paste_bytes, to_color, Key as K, Mods, Rgb, Session, BG};
+use term_core::{click_move_bytes, dim, key_bytes, paste_bytes, to_color, Key as K, Mods, Rgb, Session, BG};
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -396,7 +396,24 @@ impl winit::application::ApplicationHandler<Ev> for App {
             }
             WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => {
                 let g = self.g.as_ref().unwrap();
-                if state == ElementState::Released { self.anchor = None; return; }
+                if state == ElementState::Released {
+                    if let Some(a) = self.anchor.take() {
+                        let t = self.session.term.lock().unwrap();
+                        let c = t.grid().cursor.point;
+                        let (r0, r1) = (c.line.0.min(a.line.0), c.line.0.max(a.line.0));
+                        let cols = t.columns();
+                        // Clic simple sin arrastre, en pantalla normal y sin ratón de la app, dentro de la misma línea envuelta.
+                        let ok = t.grid().display_offset() == 0 && t.selection.is_none() && self.point(0) == a
+                            && !t.mode().intersects(TermMode::ALT_SCREEN | TermMode::MOUSE_MODE)
+                            && (r0..r1).all(|l| t.grid()[Line(l)][Column(cols - 1)].flags.contains(Flags::WRAPLINE));
+                        drop(t);
+                        if ok {
+                            let b = click_move_bytes((c.line.0 as usize, c.column.0), (a.line.0 as usize, a.column.0), cols);
+                            self.session.send(&b);
+                        }
+                    }
+                    return;
+                }
                 let (mx, my) = self.mouse;
                 if g.chip_rect.is_some_and(|[x, y, w, h]| mx >= x && mx <= x + w && my >= y && my <= y + h) {
                     self.session.term.lock().unwrap().scroll_display(Scroll::Bottom);

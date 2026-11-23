@@ -101,6 +101,13 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed { format!("\x1b[200~{t}\x1b[201~").into_bytes() } else { t.replace('\n', "\r").into_bytes() }
 }
 
+/// Clic en (fila,col) con el cursor en otra celda de la misma línea envuelta -> flechas ←/→ para llegar.
+pub fn click_move_bytes(cursor: (usize, usize), click: (usize, usize), cols: usize) -> Vec<u8> {
+    let d = (click.0 * cols + click.1) as isize - (cursor.0 * cols + cursor.1) as isize;
+    let arrow: &[u8] = if d < 0 { b"\x1b[D" } else { b"\x1b[C" };
+    arrow.repeat(d.unsigned_abs())
+}
+
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
 pub struct Listener(Writer);
@@ -204,6 +211,14 @@ mod tests {
         assert_eq!(key_bytes(Key::ArrowUp, m(true, false, true), false), Some(b"\x1b[1;6A".to_vec()));
         assert_eq!(key_bytes(Key::ArrowLeft, m(false, true, false), false), Some(b"\x1bb".to_vec()));
         assert_eq!(key_bytes(Key::ArrowRight, m(false, true, false), false), Some(b"\x1bf".to_vec()));
+    }
+    #[test]
+    fn clic_mueve_cursor() {
+        assert_eq!(click_move_bytes((0, 5), (0, 3), 10), b"\x1b[D\x1b[D".to_vec());
+        assert_eq!(click_move_bytes((0, 5), (0, 7), 10), b"\x1b[C\x1b[C".to_vec());
+        assert_eq!(click_move_bytes((0, 8), (1, 2), 10), b"\x1b[C".repeat(4));
+        assert_eq!(click_move_bytes((1, 2), (0, 8), 10), b"\x1b[D".repeat(4));
+        assert!(click_move_bytes((0, 5), (0, 5), 10).is_empty());
     }
     #[test]
     fn pegado() {
