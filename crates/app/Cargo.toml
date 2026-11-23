@@ -1,0 +1,13 @@
+[package]
+name = "mi-terminal"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mi-terminal"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "=0.37.0", default-features = false, features = ["wgpu", "default_fonts", "clipboard"] }
+portable-pty = "=0.9.0"
+alacritty_terminal = { version = "=0.26.0", default-features = false }
