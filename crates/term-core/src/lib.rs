@@ -7,12 +7,12 @@ use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 pub type Rgb = [u8; 3];
 pub const BG: Rgb = [0x0b, 0x0b, 0x0d];
 pub const FG: Rgb = [0xd4, 0xd4, 0xd4];
-pub const SCROLLBACK: usize = 5_000;
+pub const SCROLLBACK: usize = 3_000;
 const PALETTE: [Rgb; 16] = [
     [0x1c, 0x1c, 0x1e], [0xe0, 0x5a, 0x5a], [0x5a, 0xc0, 0x6a], [0xd9, 0xb0, 0x5a],
     [0x5a, 0x8a, 0xe0], [0xb0, 0x70, 0xd0], [0x4a, 0xc0, 0xc0], [0xd4, 0xd4, 0xd4],
@@ -140,6 +140,7 @@ pub struct Session {
     pub title: Arc<Mutex<String>>,
     writer: Writer,
     master: Box<dyn MasterPty + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
 impl Session {
@@ -168,6 +169,7 @@ impl Session {
         c.env("COLORTERM", "truecolor");
         if let Some(h) = std::env::var_os("HOME") { c.cwd(h); }
         let mut child = pair.slave.spawn_command(c).expect("spawn");
+        let killer = child.clone_killer();
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
         let mut reader = pair.master.try_clone_reader().expect("reader");
         let title = Arc::new(Mutex::new(String::new()));
@@ -185,7 +187,7 @@ impl Session {
             on_exit();
         });
         std::thread::spawn(move || { let _ = child.wait(); });
-        Self { term, title, writer, master: pair.master }
+        Self { term, title, writer, master: pair.master, killer }
     }
 
     pub fn send(&self, b: &[u8]) { let _ = self.writer.lock().unwrap().write_all(b); }
@@ -196,9 +198,25 @@ impl Session {
     }
 }
 
+/// Al soltar la sesión (cerrar panel/pestaña) se mata el hijo: el wait() y el lector terminan solos (EOF).
+impl Drop for Session {
+    fn drop(&mut self) { let _ = self.killer.kill(); }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn drop_mata_al_hijo() {
+        let marca = "sleep 98765";
+        let s = Session::spawn(Some(vec!["sh".into(), "-c".into(), format!("exec {marca}")]), || {}, || {});
+        let vivo = || std::process::Command::new("pgrep").args(["-f", marca]).output().unwrap().status.success();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(vivo());
+        drop(s);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!vivo());
+    }
     #[test]
     fn colores() {
         assert_eq!(to_color(Color::Indexed(196), true), [255, 0, 0]);

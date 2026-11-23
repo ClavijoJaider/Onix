@@ -410,7 +410,7 @@ fn init_gfx(el: &ActiveEventLoop) -> Gfx {
     let cfg = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: sz.width.max(1), height: sz.height.max(1),
         present_mode: wgpu::PresentMode::Fifo, alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-        view_formats: vec![], desired_maximum_frame_latency: 2, color_space: wgpu::SurfaceColorSpace::Auto };
+        view_formats: vec![], desired_maximum_frame_latency: 1, color_space: wgpu::SurfaceColorSpace::Auto };
     surface.configure(&device, &cfg);
 
     let mut db = fontdb::Database::new();
@@ -471,7 +471,7 @@ impl App {
     }
     /// Ajusta cada panel de cada pestaña a su rect; `force` rehace buffers (escala o ventana nueva).
     fn sync_size(&mut self, force: bool) {
-        if self.g.is_none() { return; }
+        if self.g.is_none() || self.tabs.is_empty() { return; }
         let (area, sep) = (self.area(), self.sep());
         let g = self.g.as_mut().unwrap();
         if force { g.relayout(); }
@@ -542,6 +542,7 @@ impl winit::application::ApplicationHandler<Ev> for App {
         if self.g.is_none() { self.g = Some(init_gfx(el)); self.sync_size(true); self.redraw(); }
     }
     fn user_event(&mut self, el: &ActiveEventLoop, ev: Ev) {
+        if self.tabs.is_empty() { return; }
         match ev {
             Ev::Out => self.redraw(),
             Ev::Exit(id) => {
@@ -551,7 +552,7 @@ impl winit::application::ApplicationHandler<Ev> for App {
         }
     }
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
-        if self.g.is_none() { return; }
+        if self.g.is_none() || self.tabs.is_empty() { return; }
         match ev {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
