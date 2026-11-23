@@ -9,11 +9,12 @@ use term_core::alacritty_terminal::selection::{Selection, SelectionType};
 use term_core::alacritty_terminal::term::cell::Flags;
 use term_core::alacritty_terminal::term::TermMode;
 use term_core::alacritty_terminal::vte::ansi::{Color as AColor, CursorShape};
-use term_core::{dim, key_bytes, to_color, Key as K, Rgb, Session, BG};
+use term_core::{dim, key_bytes, paste_bytes, to_color, Key as K, Mods, Rgb, Session, BG};
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId};
 
 const FONT_SIZE: f32 = 13.0;
@@ -36,11 +37,13 @@ fn px_to_cell(x: f32, y: f32, cell: (f32, f32), pad: f32, cols: usize, rows: usi
     (c, r)
 }
 
+type Span = (String, Rgb, bool);
+
 struct Gfx {
     window: Arc<Window>, surface: wgpu::Surface<'static>, cfg: wgpu::SurfaceConfiguration,
     device: wgpu::Device, queue: wgpu::Queue, fs: FontSystem, sc: SwashCache, vp: Viewport,
     atlas: TextAtlas, tr: TextRenderer, tr2: TextRenderer, pipe: wgpu::RenderPipeline,
-    ibuf: wgpu::Buffer, icap: usize, bufs: Vec<Buffer>, chip: Buffer,
+    ibuf: wgpu::Buffer, icap: usize, bufs: Vec<Buffer>, prev: Vec<Option<Vec<Span>>>, chip: Buffer,
     scale: f32, cell: (f32, f32), cols: usize, rows: usize, chip_rect: Option<[f32; 4]>,
 }
 
@@ -69,6 +72,13 @@ impl Gfx {
         let n = self.rows;
         self.bufs.clear();
         for _ in 0..n { let b = self.new_buf(); self.bufs.push(b); }
+        self.prev = vec![None; n];
+        // Chip "Jump to bottom": se crea una vez por relayout, no por frame.
+        let mut b = Buffer::new(&mut self.fs, m);
+        b.set_size(Some((CHIP.chars().count() + 2) as f32 * w), Some(self.cell.1));
+        b.set_text(CHIP, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
+        b.shape_until_scroll(&mut self.fs, false);
+        self.chip = b;
         (self.cols, self.rows)
     }
 }
@@ -126,7 +136,7 @@ fn draw(g: &mut Gfx, s: &Session) {
             }
             i = j;
         }
-        let mut spans: Vec<(String, Rgb, bool)> = vec![];
+        let mut spans: Vec<Span> = vec![];
         for c in row {
             match spans.last_mut() {
                 Some(l) if l.1 == c.3 && l.2 == c.5 => l.0.push(c.2),
@@ -137,8 +147,12 @@ fn draw(g: &mut Gfx, s: &Session) {
         let it = spans.iter().map(|(t, f, b)| {
             (t.as_str(), base.clone().color(Color::rgb(f[0], f[1], f[2])).weight(if *b { Weight::BOLD } else { Weight::NORMAL }))
         });
-        g.bufs[r].set_rich_text(it, &base, Shaping::Advanced, None);
-        g.bufs[r].shape_until_scroll(&mut g.fs, false);
+        // Solo se reforma la fila si su contenido cambió respecto al frame anterior.
+        if g.prev[r].as_ref() != Some(&spans) {
+            g.bufs[r].set_rich_text(it, &base, Shaping::Advanced, None);
+            g.bufs[r].shape_until_scroll(&mut g.fs, false);
+            g.prev[r] = Some(spans);
+        }
     }
     let n_bg = rects.len();
 
@@ -149,12 +163,6 @@ fn draw(g: &mut Gfx, s: &Session) {
         let (h, x, y) = (ch * 1.5, sz.0 / 2.0 - w / 2.0, sz.1 - pad - ch * 3.0);
         rect(&mut rects, sz, x, y, w, h, [0x2a, 0x2a, 0x32]);
         g.chip_rect = Some([x, y, w, h]);
-        let m = g.metrics();
-        let mut b = Buffer::new(&mut g.fs, m);
-        b.set_size(Some(w), Some(ch));
-        b.set_text(CHIP, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
-        b.shape_until_scroll(&mut g.fs, false);
-        g.chip = b;
     }
     if rects.len() > g.icap {
         g.icap = rects.len().next_power_of_two();
@@ -177,7 +185,13 @@ fn draw(g: &mut Gfx, s: &Session) {
 
     let frame = match g.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(f) => f,
-        _ => { g.surface.configure(&g.device, &g.cfg); g.window.request_redraw(); return; }
+        wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+        // Superficie cambiada: reconfigurar y reintentar una vez.
+        wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+            g.surface.configure(&g.device, &g.cfg); g.window.request_redraw(); return;
+        }
+        // Occluded/Timeout/Validation: sin redraw; Occluded(false) o el próximo evento lo reanudan.
+        _ => return,
     };
     let view = frame.texture.create_view(&Default::default());
     let mut enc = g.device.create_command_encoder(&Default::default());
@@ -248,7 +262,7 @@ fn init_gfx(el: &ActiveEventLoop) -> Gfx {
     let ibuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let mut g = Gfx {
         window, surface, cfg, device, queue, fs, sc: SwashCache::new(), vp, atlas, tr, tr2, pipe, ibuf, icap: 1,
-        bufs: vec![], chip: Buffer::new_empty(Metrics::new(1.0, 1.0)),
+        bufs: vec![], prev: vec![], chip: Buffer::new_empty(Metrics::new(1.0, 1.0)),
         scale: 1.0, cell: (8.0, 16.0), cols: 80, rows: 24, chip_rect: None };
     g.relayout();
     g
@@ -267,6 +281,17 @@ impl App {
         if (c, r) != cur {
             self.session.resize(c, r);
         }
+    }
+    /// Entrada de teclado/pegado: vuelve al final del scroll y quita la selección, como una terminal.
+    fn send_input(&mut self, b: &[u8]) {
+        {
+            let mut t = self.session.term.lock().unwrap();
+            t.selection = None;
+            t.scroll_display(Scroll::Bottom);
+        }
+        self.anchor = None;
+        self.session.send(b);
+        if let Some(g) = &self.g { g.window.request_redraw(); }
     }
     fn point(&self, off: usize) -> Point {
         let g = self.g.as_ref().unwrap();
@@ -298,6 +323,7 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 self.sync_size();
                 self.g.as_ref().unwrap().window.request_redraw();
             }
+            WindowEvent::Occluded(false) => self.g.as_ref().unwrap().window.request_redraw(),
             WindowEvent::RedrawRequested => draw(self.g.as_mut().unwrap(), &self.session),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let (cmd, ctrl) = (self.mods.super_key(), self.mods.control_key());
@@ -307,18 +333,17 @@ impl winit::application::ApplicationHandler<Ev> for App {
                             if let Some(s) = self.session.term.lock().unwrap().selection_to_string() { pbcopy(&s); }
                         }
                         Key::Character("v") => {
-                            let t = pbpaste();
-                            if self.session.term.lock().unwrap().mode().contains(TermMode::BRACKETED_PASTE) {
-                                self.session.send(format!("\x1b[200~{t}\x1b[201~").as_bytes());
-                            } else {
-                                self.session.send(t.as_bytes());
-                            }
+                            let br = self.session.term.lock().unwrap().mode().contains(TermMode::BRACKETED_PASTE);
+                            self.send_input(&paste_bytes(&pbpaste(), br));
                         }
                         _ => {}
                     }
                     return;
                 }
-                let key = match &event.logical_key {
+                let m = Mods { shift: self.mods.shift_key(), alt: self.mods.alt_key(), ctrl };
+                // Con Option, macOS compone el carácter (∫): usar la tecla base para enviarla como Meta.
+                let base = if m.alt { event.key_without_modifiers() } else { event.logical_key.clone() };
+                let key = match &base {
                     Key::Named(NamedKey::Enter) => Some(K::Enter),
                     Key::Named(NamedKey::Backspace) => Some(K::Backspace),
                     Key::Named(NamedKey::Tab) => Some(K::Tab),
@@ -332,14 +357,15 @@ impl winit::application::ApplicationHandler<Ev> for App {
                     Key::Named(NamedKey::Delete) => Some(K::Delete),
                     Key::Named(NamedKey::PageUp) => Some(K::PageUp),
                     Key::Named(NamedKey::PageDown) => Some(K::PageDown),
-                    Key::Character(s) if ctrl => s.chars().next().map(K::Char),
+                    Key::Character(s) if ctrl || m.alt => s.chars().next()
+                        .map(|c| K::Char(if m.shift && !ctrl { c.to_ascii_uppercase() } else { c })),
                     _ => None,
                 };
                 let app_cursor = self.session.term.lock().unwrap().mode().contains(TermMode::APP_CURSOR);
-                if let Some(b) = key.and_then(|k| key_bytes(k, ctrl, app_cursor)) {
-                    self.session.send(&b);
-                } else if !ctrl {
-                    if let Some(t) = &event.text { self.session.send(t.as_bytes()); }
+                if let Some(b) = key.and_then(|k| key_bytes(k, m, app_cursor)) {
+                    self.send_input(&b);
+                } else if !ctrl && !m.alt {
+                    if let Some(t) = &event.text { self.send_input(t.as_bytes()); }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {

@@ -55,12 +55,28 @@ pub enum Key {
     Home, End, Delete, PageUp, PageDown, Char(char),
 }
 
-/// Tecla -> bytes que espera el PTY.
-pub fn key_bytes(key: Key, ctrl: bool, app_cursor: bool) -> Option<Vec<u8>> {
-    let arrow = |c: u8| Some(vec![0x1b, if app_cursor { b'O' } else { b'[' }, c]);
+/// Modificadores activos (Option = alt, se envía como Meta).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Mods { pub shift: bool, pub alt: bool, pub ctrl: bool }
+
+/// Tecla + modificadores -> bytes que espera el PTY.
+pub fn key_bytes(key: Key, m: Mods, app_cursor: bool) -> Option<Vec<u8>> {
+    let n = 1 + m.shift as u8 + 2 * m.alt as u8 + 4 * m.ctrl as u8; // parámetro xterm
+    let arrow = |c: u8| {
+        if m.alt && !m.shift && !m.ctrl && (c == b'C' || c == b'D') {
+            // Option+←/→: salto de palabra (ESC b / ESC f)
+            Some(vec![0x1b, if c == b'D' { b'b' } else { b'f' }])
+        } else if n > 1 {
+            Some(format!("\x1b[1;{n}{}", c as char).into_bytes())
+        } else {
+            Some(vec![0x1b, if app_cursor { b'O' } else { b'[' }, c])
+        }
+    };
+    let meta = |mut v: Vec<u8>| { if m.alt { v.insert(0, 0x1b); } Some(v) };
     match key {
-        Key::Enter => Some(b"\r".to_vec()),
-        Key::Backspace => Some(vec![0x7f]),
+        Key::Enter => meta(b"\r".to_vec()),
+        Key::Backspace => meta(vec![0x7f]),
+        Key::Tab if m.shift => Some(b"\x1b[Z".to_vec()),
         Key::Tab => Some(b"\t".to_vec()),
         Key::Escape => Some(vec![0x1b]),
         Key::ArrowUp => arrow(b'A'),
@@ -72,9 +88,17 @@ pub fn key_bytes(key: Key, ctrl: bool, app_cursor: bool) -> Option<Vec<u8>> {
         Key::Delete => Some(b"\x1b[3~".to_vec()),
         Key::PageUp => Some(b"\x1b[5~".to_vec()),
         Key::PageDown => Some(b"\x1b[6~".to_vec()),
-        Key::Char(c) if ctrl && c.is_ascii_alphabetic() => Some(vec![c.to_ascii_lowercase() as u8 - b'a' + 1]),
+        Key::Char(c) if m.ctrl && c.is_ascii_alphabetic() => meta(vec![c.to_ascii_lowercase() as u8 - b'a' + 1]),
+        Key::Char(c) if m.alt && !m.ctrl => meta(c.to_string().into_bytes()),
         Key::Char(_) => None,
     }
+}
+
+/// Texto pegado -> bytes: sin ESC ni controles (salvo \t y \n). Con bracketed paste se envuelve;
+/// sin él, \n pasa a \r.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let t: String = text.chars().filter(|c| !c.is_control() || *c == '\t' || *c == '\n').collect();
+    if bracketed { format!("\x1b[200~{t}\x1b[201~").into_bytes() } else { t.replace('\n', "\r").into_bytes() }
 }
 
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -167,8 +191,23 @@ mod tests {
     }
     #[test]
     fn teclas() {
-        assert_eq!(key_bytes(Key::Char('c'), true, false), Some(vec![3]));
-        assert_eq!(key_bytes(Key::ArrowUp, false, true), Some(b"\x1bOA".to_vec()));
-        assert_eq!(key_bytes(Key::Enter, false, false), Some(b"\r".to_vec()));
+        let n = Mods::default();
+        let m = |shift, alt, ctrl| Mods { shift, alt, ctrl };
+        assert_eq!(key_bytes(Key::Char('c'), m(false, false, true), false), Some(vec![3]));
+        assert_eq!(key_bytes(Key::ArrowUp, n, true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(key_bytes(Key::Enter, n, false), Some(b"\r".to_vec()));
+        assert_eq!(key_bytes(Key::Backspace, n, false), Some(vec![0x7f]));
+        assert_eq!(key_bytes(Key::Delete, n, false), Some(b"\x1b[3~".to_vec()));
+        assert_eq!(key_bytes(Key::Tab, m(true, false, false), false), Some(b"\x1b[Z".to_vec()));
+        assert_eq!(key_bytes(Key::Char('b'), m(false, true, false), false), Some(b"\x1bb".to_vec()));
+        assert_eq!(key_bytes(Key::Char('a'), n, false), None);
+        assert_eq!(key_bytes(Key::ArrowUp, m(true, false, true), false), Some(b"\x1b[1;6A".to_vec()));
+        assert_eq!(key_bytes(Key::ArrowLeft, m(false, true, false), false), Some(b"\x1bb".to_vec()));
+        assert_eq!(key_bytes(Key::ArrowRight, m(false, true, false), false), Some(b"\x1bf".to_vec()));
+    }
+    #[test]
+    fn pegado() {
+        assert_eq!(paste_bytes("a\x1b[201~b\r\nc\td", true), b"\x1b[200~a[201~b\nc\td\x1b[201~".to_vec());
+        assert_eq!(paste_bytes("a\nb\x07", false), b"a\rb".to_vec());
     }
 }
