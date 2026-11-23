@@ -141,6 +141,8 @@ pub struct Session {
     writer: Writer,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// PID del hijo (zsh o el CLI lanzado).
+    pub child_pid: Option<u32>,
 }
 
 impl Session {
@@ -170,6 +172,7 @@ impl Session {
         if let Some(h) = std::env::var_os("HOME") { c.cwd(h); }
         let mut child = pair.slave.spawn_command(c).expect("spawn");
         let killer = child.clone_killer();
+        let child_pid = child.process_id();
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
         let mut reader = pair.master.try_clone_reader().expect("reader");
         let title = Arc::new(Mutex::new(String::new()));
@@ -187,8 +190,11 @@ impl Session {
             on_exit();
         });
         std::thread::spawn(move || { let _ = child.wait(); });
-        Self { term, title, writer, master: pair.master, killer }
+        Self { term, title, writer, master: pair.master, killer, child_pid }
     }
+
+    /// PID del proceso en primer plano del PTY (el líder de su grupo), si se conoce.
+    pub fn fg_pid(&self) -> Option<i32> { self.master.process_group_leader() }
 
     pub fn send(&self, b: &[u8]) { let _ = self.writer.lock().unwrap().write_all(b); }
 

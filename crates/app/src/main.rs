@@ -1,8 +1,12 @@
 //! mi-terminal: ventana winit + wgpu (Metal) + glyphon sobre term-core.
+mod sidebar;
+
 use glyphon::*;
+use sidebar as sb;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 use term_core::alacritty_terminal::grid::{Dimensions, Scroll};
 use term_core::alacritty_terminal::index::{Column, Line, Point, Side};
 use term_core::alacritty_terminal::selection::{Selection, SelectionType};
@@ -27,6 +31,9 @@ const TAB_ACTIVE: Rgb = [0x16, 0x16, 0x1a];
 const TAB_HOVER: Rgb = [0x10, 0x10, 0x13];
 const SEP_W: f32 = 1.0;
 const SEP_COLOR: Rgb = [0x26, 0x26, 0x2c];
+const SIDE_BG: Rgb = [0x09, 0x09, 0x0b];
+const BTN_BG: Rgb = [0x16, 0x16, 0x1a];
+const TITLE_CH: usize = 24;
 const CHIP: &str = "Jump to bottom (click) ↓";
 const SHADER: &str = "
 struct VO { @builtin(position) p: vec4<f32>, @location(0) c: vec4<f32> };
@@ -36,7 +43,7 @@ struct VO { @builtin(position) p: vec4<f32>, @location(0) c: vec4<f32> };
 }
 @fragment fn fs(v: VO) -> @location(0) vec4<f32> { return v.c; }";
 
-enum Ev { Out, Exit(u64) }
+enum Ev { Out(u64), Exit(u64), Tick }
 
 /// Rectángulo en píxeles: (x, y, ancho, alto).
 type R = (f32, f32, f32, f32);
@@ -82,9 +89,12 @@ const TAB_MAX_W: f32 = 200.0;
 const PLUS_W: f32 = 30.0;
 const CLOSE_S: f32 = 16.0;
 
-/// Rects (px) de las `n` pestañas y del botón `+`, para una ventana de `width` px y escala `sc`.
-fn bar_rects(n: usize, width: f32, sc: f32) -> (Vec<R>, R) {
-    let (x0, h) = (BAR_LEFT * sc, TABBAR_H * sc);
+/// Inicio (px) de las pestañas: tras la barra lateral si se ve; si no, tras semáforos y botón de la barra.
+fn bar_left(side: bool, sc: f32) -> f32 { (if side { sb::SIDE_W } else { BAR_LEFT + 32.0 }) * sc }
+
+/// Rects (px) de las `n` pestañas y del botón `+`, desde `x0`, para una ventana de `width` px y escala `sc`.
+fn bar_rects(n: usize, width: f32, sc: f32, x0: f32) -> (Vec<R>, R) {
+    let h = TABBAR_H * sc;
     let tw = ((width - x0 - BAR_RIGHT * sc - PLUS_W * sc) / n.max(1) as f32).clamp(40.0 * sc, TAB_MAX_W * sc);
     ((0..n).map(|i| (x0 + i as f32 * tw, 0.0, tw, h)).collect(), (x0 + n as f32 * tw, 0.0, PLUS_W * sc, h))
 }
@@ -94,8 +104,8 @@ fn close_rect(t: R, sc: f32) -> R { (t.0 + t.2 - (CLOSE_S + 8.0) * sc, (t.3 - CL
 
 fn inside(r: R, m: (f32, f32)) -> bool { m.0 >= r.0 && m.0 < r.0 + r.2 && m.1 >= r.1 && m.1 < r.1 + r.3 }
 
-fn bar_hit(m: (f32, f32), n: usize, width: f32, sc: f32) -> Option<BarHit> {
-    let (tabs, plus) = bar_rects(n, width, sc);
+fn bar_hit(m: (f32, f32), n: usize, width: f32, sc: f32, x0: f32) -> Option<BarHit> {
+    let (tabs, plus) = bar_rects(n, width, sc, x0);
     if inside(plus, m) { return Some(BarHit::Plus); }
     tabs.iter().position(|&t| inside(t, m)).map(|i| if inside(close_rect(tabs[i], sc), m) { BarHit::Close(i) } else { BarHit::Tab(i) })
 }
@@ -108,12 +118,13 @@ struct Gfx {
     window: Arc<Window>, surface: wgpu::Surface<'static>, cfg: wgpu::SurfaceConfiguration,
     device: wgpu::Device, queue: wgpu::Queue, fs: FontSystem, sc: SwashCache, vp: Viewport,
     atlas: TextAtlas, tr: TextRenderer, tr2: TextRenderer, pipe: wgpu::RenderPipeline,
-    ibuf: wgpu::Buffer, icap: usize, chip: Buffer, icons: Vec<Buffer>, scale: f32, cell: (f32, f32),
+    ibuf: wgpu::Buffer, icap: usize, chip: Buffer, icons: Vec<Buffer>, side: Vec<(String, Buffer)>, scale: f32, cell: (f32, f32),
 }
 
 struct Pane {
     id: u64, session: Session, anchor: Option<Point>, bufs: Vec<Buffer>, prev: Vec<Option<Vec<Span>>>,
     chip_rect: Option<[f32; 4]>, cols: usize, rows: usize, rect: R,
+    born: Instant, last_out: Instant, unread: bool, agent: sb::Agent, had_agent: bool, project: String,
 }
 
 impl Pane {
@@ -131,6 +142,14 @@ impl Pane {
         }
         let cur = { let t = self.session.term.lock().unwrap(); (t.columns(), t.screen_lines()) };
         if (c, r) != cur { self.session.resize(c, r); }
+    }
+    /// Agente en primer plano y proyecto (cwd) vía libproc.
+    fn refresh(&mut self) {
+        let Some(pid) = self.session.fg_pid().or(self.session.child_pid.map(|p| p as i32)) else { return };
+        let (name, path, cwd) = sb::proc_info(pid);
+        self.agent = sb::agent_from(&name, &path);
+        self.had_agent |= self.agent != sb::Agent::Shell;
+        if !cwd.is_empty() { self.project = sb::project_of(&cwd, &std::env::var("HOME").unwrap_or_default()); }
     }
     fn point(&self, mouse: (f32, f32), cell: (f32, f32), pad: f32, off: usize) -> Point {
         let (c, r) = mouse_cell(mouse, self.rect, cell, pad, self.cols, self.rows);
@@ -175,7 +194,7 @@ impl Gfx {
         self.chip = b;
         // Glifos sueltos de la barra de pestañas: ícono, +, x, pulso y globo.
         let bm = self.bar_metrics();
-        self.icons = ["✻", "+", "×", "∿", "◎"].iter().map(|t| {
+        self.icons = ["✻", "+", "×", "∿", "◎", "◧"].iter().map(|t| {
             let mut b = Buffer::new(&mut self.fs, bm);
             b.set_size(Some(40.0 * self.scale), Some(bm.line_height));
             b.set_text(t, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
@@ -185,13 +204,27 @@ impl Gfx {
     }
 }
 
+/// Una fila por panel de cada pestaña, con su estado actual.
+fn entries(tabs: &[Tab], active_tab: usize) -> Vec<sb::Entry> {
+    let now = Instant::now();
+    tabs.iter().enumerate().flat_map(|(ti, t)| t.panes.iter().enumerate().map(move |(pi, p)| {
+        let title = p.session.title.lock().unwrap().clone();
+        sb::Entry {
+            tab: ti, pane: pi, project: p.project.clone(), agent: p.agent, unread: p.unread, focused: ti == active_tab && pi == t.active,
+            status: sb::status(p.agent, p.had_agent, now.duration_since(p.last_out), &title),
+            title: sb::clean_title(if title.is_empty() { "zsh" } else { &title }, TITLE_CH),
+            secs: now.duration_since(p.born).as_secs(),
+        }
+    })).collect()
+}
+
 type Inst = [f32; 8];
 fn rect(out: &mut Vec<Inst>, sz: (f32, f32), x: f32, y: f32, w: f32, h: f32, c: Rgb) {
     let (nx, ny) = (x / sz.0 * 2.0 - 1.0, 1.0 - y / sz.1 * 2.0);
     out.push([nx, ny, w / sz.0 * 2.0, -h / sz.1 * 2.0, c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0]);
 }
 
-fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32)) {
+fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), side: &sb::Side) {
     let bm = g.bar_metrics();
     for t in tabs.iter_mut() {
         let title = t.title();
@@ -205,14 +238,76 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32)) {
         }
     }
     let tabs_len = tabs.len();
+    let ents_all = entries(tabs, active_tab);
     let tab = &mut tabs[active_tab];
     let sz = (g.cfg.width as f32, g.cfg.height as f32);
     let (cw, ch) = g.cell;
     let pad = PAD * g.scale;
     let mut rects: Vec<Inst> = vec![];
     rect(&mut rects, sz, 0.0, 0.0, sz.0, TABBAR_H * g.scale, TABBAR_BG);
-    let (trs, plus) = bar_rects(tabs_len, sz.0, g.scale);
-    let hover = bar_hit(mouse, tabs_len, sz.0, g.scale);
+    let left = bar_left(side.visible, g.scale);
+    let (trs, plus) = bar_rects(tabs_len, sz.0, g.scale, left);
+    let hover = bar_hit(mouse, tabs_len, sz.0, g.scale, left);
+    // Barra lateral: rects y textos (los buffers se reutilizan por índice, solo lo visible).
+    let mut stxt: Vec<(String, f32, f32, Color)> = vec![];
+    if side.visible {
+        let sc = g.scale;
+        let (all, wt, wk) = sb::counts(&ents_all);
+        let ents = sb::filter(ents_all, side.filter, &side.query);
+        let items = sb::group(&ents);
+        let (dimc, lit) = (Color::rgb(0x8a, 0x8a, 0x94), Color::rgb(0xd4, 0xd4, 0xd4));
+        rect(&mut rects, sz, 0.0, 0.0, sb::SIDE_W * sc, sz.1, SIDE_BG);
+        rect(&mut rects, sz, sb::SIDE_W * sc - 1.0, 0.0, 1.0, sz.1, SEP_COLOR);
+        for (r, hit) in sb::layout(sz, sc, &items) {
+            let (x, y, w, h) = r;
+            let ty = y + (h - bm.line_height) / 2.0;
+            let mut put = |t: String, dx: f32, dy: f32, c: Color| stxt.push((t, x + dx * sc, ty + dy * sc, c));
+            match hit {
+                sb::Hit::New => { rect(&mut rects, sz, x, y, w, h, BTN_BG); put("✎".into(), 10.0, 0.0, lit); put("New session".into(), 30.0, 0.0, lit); put("⇧⌘T".into(), (w - 44.0 * sc) / sc, 0.0, dimc); }
+                sb::Hit::Folder => { rect(&mut rects, sz, x, y, w, h, BTN_BG); put("▭".into(), 8.0, 0.0, dimc); }
+                sb::Hit::Search => {
+                    let t = if side.searching { format!("{}▏", side.query) } else if side.query.is_empty() { "Search agents".into() } else { side.query.clone() };
+                    put("⌕".into(), 10.0, 0.0, dimc); put(t, 30.0, 0.0, if side.query.is_empty() && !side.searching { dimc } else { lit });
+                    put("/".into(), (w - 20.0 * sc) / sc, 0.0, dimc);
+                }
+                sb::Hit::Filter(f) => {
+                    if side.filter == f { rect(&mut rects, sz, x + 2.0 * sc, y, w - 4.0 * sc, h, [0x24, 0x24, 0x2a]); }
+                    let t = match f { sb::Filter::All => format!("All {all}"), sb::Filter::Waiting if wt > 0 => format!("Waiting {wt}"), sb::Filter::Waiting => "Waiting".into(), sb::Filter::Working => format!("Working {wk}") };
+                    put(t, 12.0, 0.0, if side.filter == f { lit } else { dimc });
+                }
+                sb::Hit::Group(i) => if let sb::Item::Group(p) = &items[i] { put(p.clone(), 14.0, 0.0, dimc); },
+                sb::Hit::Row(j) => {
+                    let e = &ents[j];
+                    if e.focused { rect(&mut rects, sz, x + 6.0 * sc, y, w - 12.0 * sc, h, [0x1a, 0x1a, 0x20]); }
+                    let c = e.agent.color();
+                    let st = match e.status { sb::Status::Done => Color::rgb(0x5a, 0xc0, 0x6a), _ => dimc };
+                    put(e.agent.glyph().into(), 18.0, -9.0, Color::rgb(c[0], c[1], c[2]));
+                    if e.unread { put("●".into(), 8.0, -12.0, Color::rgb(0x5a, 0xc0, 0x6a)); }
+                    put(e.title.clone(), 38.0, -9.0, lit);
+                    put(sb::fmt_elapsed(e.secs), (w - 40.0 * sc) / sc, -9.0, dimc);
+                    put(e.status.label().into(), 38.0, 7.0, st);
+                }
+                sb::Hit::Launch(i) => {
+                    let a = sb::LAUNCH[i].0;
+                    let c = if side.installed[i] { a.color() } else { [0x3a, 0x3a, 0x42] };
+                    put(a.glyph().into(), 8.0, 0.0, Color::rgb(c[0], c[1], c[2]));
+                }
+                sb::Hit::Archived => { put("▤".into(), 10.0, 0.0, dimc); put("Archived".into(), 30.0, 0.0, dimc); put(side.archived.len().to_string(), (w - 24.0 * sc) / sc, 0.0, dimc); }
+            }
+        }
+        let bm = g.bar_metrics();
+        for (i, (t, ..)) in stxt.iter().enumerate() {
+            if i >= g.side.len() { let b = Buffer::new(&mut g.fs, bm); g.side.push((String::new(), b)); }
+            let (k, b) = &mut g.side[i];
+            if k != t {
+                b.set_size(Some(sb::SIDE_W * sc), Some(bm.line_height));
+                b.set_wrap(Wrap::None);
+                b.set_text(t, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
+                b.shape_until_scroll(&mut g.fs, false);
+                *k = t.clone();
+            }
+        }
+    }
     for (i, &t) in trs.iter().enumerate() {
         if i == active_tab { rect(&mut rects, sz, t.0, t.1, t.2, t.3, TAB_ACTIVE); }
         else if hover == Some(BarHit::Tab(i)) || hover == Some(BarHit::Close(i)) { rect(&mut rects, sz, t.0, t.1, t.2, t.3, TAB_HOVER); }
@@ -338,6 +433,11 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32)) {
         }
     }
     bar.push(TextArea { buffer: &g.icons[1], left: plus.0 + 10.0 * sc, top: ty, scale: 1.0, bounds: full, default_color: dim_c, custom_glyphs: &[] });
+    bar.push(TextArea { buffer: &g.icons[5], left: (BAR_LEFT + 6.0) * sc, top: ty, scale: 1.0, bounds: full, default_color: dim_c, custom_glyphs: &[] });
+    let sb_bounds = TextBounds { left: 0, top: 0, right: (sb::SIDE_W * sc) as i32, bottom: g.cfg.height as i32 };
+    for ((_, x, y, c), (_, b)) in stxt.iter().zip(&g.side) {
+        bar.push(TextArea { buffer: b, left: *x, top: *y, scale: 1.0, bounds: sb_bounds, default_color: *c, custom_glyphs: &[] });
+    }
     for (k, x) in [(3, 56.0), (4, 28.0)] {
         bar.push(TextArea { buffer: &g.icons[k], left: sz.0 - x * sc, top: ty, scale: 1.0, bounds: full, default_color: dim_c, custom_glyphs: &[] });
     }
@@ -436,7 +536,7 @@ fn init_gfx(el: &ActiveEventLoop) -> Gfx {
     let ibuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let mut g = Gfx {
         window, surface, cfg, device, queue, fs, sc: SwashCache::new(), vp, atlas, tr, tr2, pipe, ibuf, icap: 1,
-        chip: Buffer::new_empty(Metrics::new(1.0, 1.0)), icons: vec![], scale: 1.0, cell: (8.0, 16.0) };
+        chip: Buffer::new_empty(Metrics::new(1.0, 1.0)), icons: vec![], side: vec![], scale: 1.0, cell: (8.0, 16.0) };
     g.relayout();
     g
 }
@@ -444,6 +544,7 @@ fn init_gfx(el: &ActiveEventLoop) -> Gfx {
 struct App {
     g: Option<Gfx>, tabs: Vec<Tab>, active_tab: usize, next_id: u64, proxy: EventLoopProxy<Ev>,
     mods: ModifiersState, mouse: (f32, f32), scroll_acc: f32, drag_sep: bool, mouse_fwd: bool,
+    side: sb::Side,
 }
 
 impl App {
@@ -451,19 +552,21 @@ impl App {
     /// Área de paneles: la ventana menos la franja de pestañas.
     fn area(&self) -> R {
         let g = self.g.as_ref().unwrap();
-        let top = TABBAR_H * g.scale;
-        (0.0, top, g.cfg.width as f32, (g.cfg.height as f32 - top).max(1.0))
+        let (top, left) = (TABBAR_H * g.scale, if self.side.visible { sb::SIDE_W * g.scale } else { 0.0 });
+        (left, top, (g.cfg.width as f32 - left).max(1.0), (g.cfg.height as f32 - top).max(1.0))
     }
     fn redraw(&self) { if let Some(g) = &self.g { g.window.request_redraw(); } }
-    fn new_pane(&mut self) -> Pane {
+    fn new_pane(&mut self, cmd: Option<Vec<String>>) -> Pane {
         let id = self.next_id;
         self.next_id += 1;
         let (p1, p2) = (self.proxy.clone(), self.proxy.clone());
-        let session = Session::spawn(None, move || { let _ = p1.send_event(Ev::Out); }, move || { let _ = p2.send_event(Ev::Exit(id)); });
-        Pane { id, session, anchor: None, bufs: vec![], prev: vec![], chip_rect: None, cols: 0, rows: 0, rect: (0.0, 0.0, 1.0, 1.0) }
+        let session = Session::spawn(cmd, move || { let _ = p1.send_event(Ev::Out(id)); }, move || { let _ = p2.send_event(Ev::Exit(id)); });
+        Pane { id, session, anchor: None, bufs: vec![], prev: vec![], chip_rect: None, cols: 0, rows: 0, rect: (0.0, 0.0, 1.0, 1.0),
+            born: Instant::now(), last_out: Instant::now(), unread: false, agent: sb::Agent::Shell, had_agent: false, project: "~".into() }
     }
-    fn new_tab(&mut self) {
-        let p = self.new_pane();
+    fn new_tab(&mut self) { self.new_tab_with(None); }
+    fn new_tab_with(&mut self, cmd: Option<Vec<String>>) {
+        let p = self.new_pane(cmd);
         self.tabs.push(Tab { panes: vec![p], active: 0, split: 0.5, tbuf: Buffer::new_empty(Metrics::new(1.0, 1.0)), tprev: String::new() });
         self.active_tab = self.tabs.len() - 1;
         self.sync_size(false);
@@ -481,8 +584,64 @@ impl App {
             for (p, r) in t.panes.iter_mut().zip(rs) { p.fit(g, r, force); }
         }
     }
+    /// Guarda en memoria (con su proyecto y hora) una sesión que se cierra. shortcut: sin persistir en disco, tope 200.
+    fn archive(&mut self, ti: usize, pi: usize) {
+        let p = &mut self.tabs[ti].panes[pi];
+        p.refresh();
+        let t = p.session.title.lock().unwrap().clone();
+        let title = sb::clean_title(if t.is_empty() { "zsh" } else { &t }, TITLE_CH);
+        self.side.archived.push(sb::Archived { title, project: p.project.clone(), at: SystemTime::now() });
+        if self.side.archived.len() > 200 { self.side.archived.remove(0); }
+    }
+    fn toggle_side(&mut self) {
+        self.side.visible = !self.side.visible;
+        self.side.searching = false;
+        if self.side.visible { for t in &mut self.tabs { for p in &mut t.panes { p.refresh(); } } }
+        self.sync_size(false);
+        self.redraw();
+    }
+    fn side_click(&mut self) {
+        let (g, m) = (self.g.as_ref().unwrap(), self.mouse);
+        let (sc, sz) = (g.scale, (g.cfg.width as f32, g.cfg.height as f32));
+        if m.1 < TABBAR_H * sc { let _ = g.window.drag_window(); return; }
+        let ents = sb::filter(entries(&self.tabs, self.active_tab), self.side.filter, &self.side.query);
+        let lay = sb::layout(sz, sc, &sb::group(&ents));
+        self.side.focus = true;
+        self.side.searching = false;
+        match sb::hit_at(&lay, m) {
+            Some(sb::Hit::New | sb::Hit::Folder) => { self.side.focus = false; self.new_tab(); } // sin selector nativo: ~
+            Some(sb::Hit::Search) => self.side.searching = true,
+            Some(sb::Hit::Filter(f)) => self.side.filter = f,
+            Some(sb::Hit::Row(j)) => { let e = &ents[j]; self.side.focus = false; self.active_tab = e.tab; self.tabs[e.tab].active = e.pane; }
+            Some(sb::Hit::Launch(i)) if self.side.installed[i] => {
+                self.side.focus = false;
+                self.new_tab_with(Some(vec!["zsh".into(), "-lic".into(), format!("exec {}", sb::LAUNCH[i].1)]));
+            }
+            _ => {}
+        }
+        self.redraw();
+    }
+    /// Teclas de la barra: `/` con foco abre el buscador; en búsqueda se escribe en él. true = consumida.
+    fn side_key(&mut self, ev: &winit::event::KeyEvent) -> bool {
+        let s = &mut self.side;
+        if s.searching {
+            match &ev.logical_key {
+                Key::Named(NamedKey::Escape) => { s.searching = false; s.query.clear(); }
+                Key::Named(NamedKey::Enter) => s.searching = false,
+                Key::Named(NamedKey::Backspace) => { s.query.pop(); }
+                _ => if let Some(t) = &ev.text { s.query.extend(t.chars().filter(|c| !c.is_control())); },
+            }
+        } else if s.visible && s.focus && ev.logical_key.as_ref() == Key::Character("/") {
+            s.searching = true;
+        } else {
+            return false;
+        }
+        self.redraw();
+        true
+    }
     /// Cierra un panel (y su pestaña si queda vacía; sale de la app si era la última).
     fn close_pane(&mut self, el: &ActiveEventLoop, ti: usize, pi: usize) {
+        self.archive(ti, pi);
         let t = &mut self.tabs[ti];
         t.panes.remove(pi);
         if t.panes.is_empty() {
@@ -494,6 +653,7 @@ impl App {
         }
     }
     fn close_tab(&mut self, el: &ActiveEventLoop, ti: usize) {
+        for pi in 0..self.tabs[ti].panes.len() { self.archive(ti, pi); }
         self.tabs.remove(ti);
         if self.tabs.is_empty() { el.exit(); return; }
         if self.active_tab > ti || self.active_tab == self.tabs.len() { self.active_tab -= 1; }
@@ -544,7 +704,21 @@ impl winit::application::ApplicationHandler<Ev> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, ev: Ev) {
         if self.tabs.is_empty() { return; }
         match ev {
-            Ev::Out => self.redraw(),
+            Ev::Out(id) => {
+                let at = self.active_tab;
+                for (ti, t) in self.tabs.iter_mut().enumerate() {
+                    let act = t.active;
+                    for (pi, p) in t.panes.iter_mut().enumerate().filter(|(_, p)| p.id == id) {
+                        p.last_out = Instant::now();
+                        p.unread |= !(ti == at && pi == act);
+                    }
+                }
+                self.redraw();
+            }
+            Ev::Tick => if self.side.visible {
+                for t in &mut self.tabs { for p in &mut t.panes { p.refresh(); } }
+                self.redraw();
+            },
             Ev::Exit(id) => {
                 let pos = self.tabs.iter().enumerate().find_map(|(ti, t)| t.panes.iter().position(|p| p.id == id).map(|pi| (ti, pi)));
                 if let Some((ti, pi)) = pos { self.close_pane(el, ti, pi); }
@@ -565,7 +739,12 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 self.redraw();
             }
             WindowEvent::Occluded(false) => self.redraw(),
-            WindowEvent::RedrawRequested => draw(self.g.as_mut().unwrap(), &mut self.tabs, self.active_tab, self.mouse),
+            WindowEvent::RedrawRequested => {
+                let t = &mut self.tabs[self.active_tab];
+                let a = t.active;
+                t.panes[a].unread = false;
+                draw(self.g.as_mut().unwrap(), &mut self.tabs, self.active_tab, self.mouse, &self.side);
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let (cmd, ctrl) = (self.mods.super_key(), self.mods.control_key());
                 if ctrl && event.logical_key == Key::Named(NamedKey::Tab) {
@@ -573,8 +752,10 @@ impl winit::application::ApplicationHandler<Ev> for App {
                     self.redraw();
                     return;
                 }
+                if !cmd && !ctrl && self.side_key(&event) { return; }
                 if cmd {
                     match event.logical_key.as_ref() {
+                        Key::Character("b" | "\\") => self.toggle_side(),
                         Key::Character("c") => {
                             if let Some(s) = self.pane().session.term.lock().unwrap().selection_to_string() { pbcopy(&s); }
                         }
@@ -582,11 +763,11 @@ impl winit::application::ApplicationHandler<Ev> for App {
                             let br = self.pane().session.term.lock().unwrap().mode().contains(TermMode::BRACKETED_PASTE);
                             self.send_input(&paste_bytes(&pbpaste(), br));
                         }
-                        Key::Character("t") => self.new_tab(),
+                        Key::Character("t" | "T") => self.new_tab(),
                         Key::Character("w") => { let (ti, pi) = (self.active_tab, self.tabs[self.active_tab].active); self.close_pane(el, ti, pi); }
                         Key::Character("d") => {
                             if self.tabs[self.active_tab].panes.len() < 2 {
-                                let p = self.new_pane();
+                                let p = self.new_pane(None);
                                 let t = &mut self.tabs[self.active_tab];
                                 t.panes.push(p);
                                 t.active = 1;
@@ -717,9 +898,13 @@ impl winit::application::ApplicationHandler<Ev> for App {
                     return;
                 }
                 let sc = self.g.as_ref().unwrap().scale;
+                if inside((BAR_LEFT * sc, 0.0, 28.0 * sc, TABBAR_H * sc), self.mouse) { self.toggle_side(); return; }
+                if self.side.visible && self.mouse.0 < sb::SIDE_W * sc { self.side_click(); return; }
+                self.side.focus = false;
+                self.side.searching = false;
                 if self.mouse.1 < TABBAR_H * sc {
                     let w = self.g.as_ref().unwrap().cfg.width as f32;
-                    match bar_hit(self.mouse, self.tabs.len(), w, sc) {
+                    match bar_hit(self.mouse, self.tabs.len(), w, sc, bar_left(self.side.visible, sc)) {
                         Some(BarHit::Tab(i)) => { self.active_tab = i; self.redraw(); }
                         Some(BarHit::Close(i)) => self.close_tab(el, i),
                         Some(BarHit::Plus) => self.new_tab(),
@@ -773,8 +958,12 @@ fn pbpaste() -> String {
 fn main() {
     let el = EventLoop::<Ev>::with_user_event().build().unwrap();
     el.set_control_flow(ControlFlow::Wait);
+    let tick = el.create_proxy();
+    std::thread::spawn(move || while tick.send_event(Ev::Tick).is_ok() { std::thread::sleep(std::time::Duration::from_secs(1)); });
+    let side = sb::Side { visible: true, focus: false, searching: false, query: String::new(), filter: sb::Filter::All,
+        archived: vec![], installed: sb::LAUNCH.map(|(_, b)| sb::on_path(b)) };
     let mut app = App { g: None, tabs: vec![], active_tab: 0, next_id: 0, proxy: el.create_proxy(),
-        mods: ModifiersState::empty(), mouse: (0.0, 0.0), scroll_acc: 0.0, drag_sep: false, mouse_fwd: false };
+        mods: ModifiersState::empty(), mouse: (0.0, 0.0), scroll_acc: 0.0, drag_sep: false, mouse_fwd: false, side };
     app.new_tab();
     // Solo para pruebas: escribe este comando al PTY al inicio.
     if let Ok(c) = std::env::var("MI_TERMINAL_CMD") { app.pane().session.send(format!("{c}\n").as_bytes()); }
@@ -806,14 +995,14 @@ mod tests {
     }
     #[test]
     fn barra_de_pestanas() {
-        let (tabs, plus) = bar_rects(2, 1920.0, 2.0);
+        let (tabs, plus) = bar_rects(2, 1920.0, 2.0, 160.0);
         assert_eq!(tabs[0].0, 160.0);
         assert_eq!(plus.0, tabs[1].0 + tabs[1].2);
         let c = close_rect(tabs[0], 2.0);
-        assert_eq!(bar_hit((c.0 + 2.0, 30.0), 2, 1920.0, 2.0), Some(BarHit::Close(0)));
-        assert_eq!(bar_hit((tabs[1].0 + 10.0, 30.0), 2, 1920.0, 2.0), Some(BarHit::Tab(1)));
-        assert_eq!(bar_hit((plus.0 + 5.0, 30.0), 2, 1920.0, 2.0), Some(BarHit::Plus));
-        assert_eq!(bar_hit((20.0, 30.0), 2, 1920.0, 2.0), None);
+        assert_eq!(bar_hit((c.0 + 2.0, 30.0), 2, 1920.0, 2.0, 160.0), Some(BarHit::Close(0)));
+        assert_eq!(bar_hit((tabs[1].0 + 10.0, 30.0), 2, 1920.0, 2.0, 160.0), Some(BarHit::Tab(1)));
+        assert_eq!(bar_hit((plus.0 + 5.0, 30.0), 2, 1920.0, 2.0, 160.0), Some(BarHit::Plus));
+        assert_eq!(bar_hit((20.0, 30.0), 2, 1920.0, 2.0, 160.0), None);
     }
     #[test]
     fn layout_paneles() {
