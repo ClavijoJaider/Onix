@@ -923,6 +923,7 @@ version = "0.1.0"
 dependencies = [
  "glyphon",
  "pollster",
+ "serde_json",
  "term-core",
  "wgpu",
  "winit",

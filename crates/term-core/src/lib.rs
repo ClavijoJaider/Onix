@@ -101,6 +101,18 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed { format!("\x1b[200~{t}\x1b[201~").into_bytes() } else { t.replace('\n', "\r").into_bytes() }
 }
 
+/// Ruta soltada en la ventana -> texto para el shell: escapa con `\` los ASCII que no sean [A-Za-z0-9_./~+@%:,=-]
+/// (los no ASCII van sin escapar), quita controles y termina en un espacio.
+pub fn drop_path_text(path: &str) -> String {
+    let mut o = String::new();
+    for c in path.chars().filter(|c| !c.is_control()) {
+        if c.is_ascii() && !c.is_ascii_alphanumeric() && !"_./~+@%:,=-".contains(c) { o.push('\\'); }
+        o.push(c);
+    }
+    o.push(' ');
+    o
+}
+
 /// Clic en (fila,col) con el cursor en otra celda de la misma línea envuelta -> flechas ←/→ para llegar.
 /// Con APP_CURSOR activo las flechas son `ESC O x`, si no `ESC [ x` (igual que `key_bytes`).
 pub fn click_move_bytes(cursor: (usize, usize), click: (usize, usize), cols: usize, app_cursor: bool) -> Vec<u8> {
@@ -150,27 +162,43 @@ impl Session {
     /// `on_exit` cuando el PTY se cierra.
     pub fn spawn(
         cmd: Option<Vec<String>>,
+        cwd: Option<std::path::PathBuf>,
         on_output: impl Fn() + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
     ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
             .expect("openpty");
-        let mut c = match cmd {
-            Some(v) => { let mut c = CommandBuilder::new(&v[0]); c.args(&v[1..]); c }
-            None => { let mut c = CommandBuilder::new("zsh"); c.arg("-l"); c }
+        // Si el cwd pedido falla (sin permiso, borrado), se reintenta en HOME en vez de entrar en pánico.
+        let zdot = if cmd.is_none() { chip_zdotdir() } else { None };
+        let build = |dir: Option<std::ffi::OsString>| {
+            let mut c = match &cmd {
+                Some(v) => { let mut c = CommandBuilder::new(&v[0]); c.args(&v[1..]); c }
+                None => { let mut c = CommandBuilder::new("zsh"); c.arg("-l"); c }
+            };
+            // No heredar el estado de una sesión de Claude Code que lanzó la terminal
+            // (CLAUDE_CODE_CHILD_SESSION, CLAUDECODE...): hacía que `claude` arrancara como sesión hija.
+            let heredadas: Vec<_> = std::env::vars_os()
+                .filter(|(k, _)| k.to_string_lossy().starts_with("CLAUDE"))
+                .map(|(k, _)| k)
+                .collect();
+            for k in heredadas { c.env_remove(k); }
+            c.env("TERM", "xterm-256color");
+            c.env("COLORTERM", "truecolor");
+            if cmd.is_none() {
+                if let Some(z) = &zdot {
+                    if let Some(o) = std::env::var_os("ZDOTDIR") { c.env("MI_ORIG_ZDOTDIR", o); }
+                    if let Some(h) = std::env::var_os("HISTFILE") { c.env("HISTFILE_ORIG", h); }
+                    c.env("ZDOTDIR", z);
+                }
+            }
+            if let Some(h) = dir.or_else(|| std::env::var_os("HOME")) { c.cwd(h); }
+            c
         };
-        // No heredar el estado de una sesión de Claude Code que lanzó la terminal
-        // (CLAUDE_CODE_CHILD_SESSION, CLAUDECODE...): hacía que `claude` arrancara como sesión hija.
-        let heredadas: Vec<_> = std::env::vars_os()
-            .filter(|(k, _)| k.to_string_lossy().starts_with("CLAUDE"))
-            .map(|(k, _)| k)
-            .collect();
-        for k in heredadas { c.env_remove(k); }
-        c.env("TERM", "xterm-256color");
-        c.env("COLORTERM", "truecolor");
-        if let Some(h) = std::env::var_os("HOME") { c.cwd(h); }
-        let mut child = pair.slave.spawn_command(c).expect("spawn");
+        let mut child = match cwd.clone().and_then(|d| pair.slave.spawn_command(build(Some(d.into()))).ok()) {
+            Some(ch) => ch,
+            None => pair.slave.spawn_command(build(None)).expect("spawn"),
+        };
         let killer = child.clone_killer();
         let child_pid = child.process_id();
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
@@ -209,19 +237,105 @@ impl Drop for Session {
     fn drop(&mut self) { let _ = self.killer.kill(); }
 }
 
+/// Prompt con "chip" de cwd (línea con la carpeta y cursor en la siguiente) para zsh.
+/// Se hace desde el shell y no desde la terminal: solo el shell sabe dónde empieza el prompt;
+/// la terminal vería celdas sueltas y no podría dibujar un fondo redondeado fiable.
+const ZSHRC_CHIP: &str = "\
+# Generado por mi-terminal (se sobrescribe). Desactivar: MI_TERMINAL_NO_PROMPT=1
+# /etc/zshrc (entre .zshenv y .zshrc) fija HISTFILE con ZDOTDIR: se restaura antes de cargar el .zshrc del usuario.
+ZDOTDIR=${MI_ORIG_ZDOTDIR:-$HOME}
+HISTFILE=${HISTFILE_ORIG:-${MI_ORIG_ZDOTDIR:-$HOME}/.zsh_history}
+[[ -r \"${MI_ORIG_ZDOTDIR:-$HOME}/.zshrc\" ]] && source \"${MI_ORIG_ZDOTDIR:-$HOME}/.zshrc\"
+PROMPT=$'%F{244}%~%f\\n%F{4}❯%f '
+ZDOTDIR=${MI_ORIG_ZDOTDIR:-$HOME}
+unset MI_ORIG_ZDOTDIR
+";
+
+/// Reenvío de los demás archivos de inicio, porque con ZDOTDIR propio zsh ya no lee los del usuario.
+fn zsh_forward(name: &str) -> String {
+    format!("[[ -r \"${{MI_ORIG_ZDOTDIR:-$HOME}}/{name}\" ]] && source \"${{MI_ORIG_ZDOTDIR:-$HOME}}/{name}\"\n")
+}
+
+/// ¿Aplicar el prompt? No si está desactivado, si hay STARSHIP_SHELL o si el .zshrc (líneas no comentadas)
+/// usa un tema conocido o fija PROMPT/PS1 o ejecuta `prompt <tema>`.
+pub fn chip_enabled(no_prompt: Option<&str>, starship_shell: bool, zshrc: &str) -> bool {
+    const KW: [&str; 9] = ["powerlevel10k", "p10k", "starship", "oh-my-posh", "spaceship", "pure-prompt", "pure.zsh", "promptinit", "pure/"];
+    let propio = |l: &str| {
+        let l = l.trim();
+        !l.starts_with('#') && (KW.iter().any(|k| l.contains(k)) || (l.contains("prompt_") && l.contains("_setup"))
+            || ["PROMPT=", "PS1=", "export PROMPT=", "export PS1=", "prompt "].iter().any(|p| l.starts_with(p)))
+    };
+    no_prompt != Some("1") && !starship_shell && !zshrc.lines().any(propio)
+}
+
+/// Escribe `contenido` solo si cambió.
+fn write_if_changed(path: &std::path::Path, contenido: &str) -> std::io::Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|a| a == contenido) { return Ok(()); }
+    std::fs::write(path, contenido)
+}
+
+/// Prepara ~/Library/Application Support/mi-terminal/zsh y devuelve el directorio si hay que usarlo como ZDOTDIR.
+fn chip_zdotdir() -> Option<std::path::PathBuf> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let orig = std::env::var_os("ZDOTDIR").map(std::path::PathBuf::from).unwrap_or(home.clone());
+    let zshrc = std::fs::read_to_string(orig.join(".zshrc")).unwrap_or_default();
+    let no = std::env::var("MI_TERMINAL_NO_PROMPT").ok();
+    if !chip_enabled(no.as_deref(), std::env::var_os("STARSHIP_SHELL").is_some(), &zshrc) { return None; }
+    let dir = home.join("Library/Application Support/mi-terminal/zsh");
+    std::fs::create_dir_all(&dir).ok()?;
+    write_if_changed(&dir.join(".zshrc"), ZSHRC_CHIP).ok()?;
+    for n in [".zshenv", ".zprofile", ".zlogin"] { write_if_changed(&dir.join(n), &zsh_forward(n)).ok()?; }
+    Some(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn chip_activo_por_defecto() { assert!(chip_enabled(None, false, "export A=1\n")); }
+    #[test]
+    fn chip_desactivado_por_variable() { assert!(!chip_enabled(Some("1"), false, "")); assert!(chip_enabled(Some("0"), false, "")); }
+    #[test]
+    fn chip_respeta_temas() {
+        assert!(!chip_enabled(None, true, ""));
+        for t in ["source ~/powerlevel10k/powerlevel10k.zsh-theme", "[[ -f ~/.p10k.zsh ]]", "eval \"$(starship init zsh)\"", "eval \"$(oh-my-posh init zsh)\"", "source spaceship.zsh", "fpath+=$HOME/.zsh/pure-prompt", "prompt_pure_setup", "autoload promptinit; promptinit", "prompt pure", "PS1='%n> '", "export PROMPT='> '"] {
+            assert!(!chip_enabled(None, false, t), "{t}");
+        }
+    }
+    #[test]
+    fn chip_ignora_comentarios() { assert!(chip_enabled(None, false, "# eval starship\n  # PS1=x\nexport A=1\n")); }
+    #[test]
+    fn zshrc_generado() {
+        assert!(ZSHRC_CHIP.find("HISTFILE=${HISTFILE_ORIG:-${MI_ORIG_ZDOTDIR:-$HOME}/.zsh_history}").unwrap() < ZSHRC_CHIP.find("source").unwrap());
+        assert!(ZSHRC_CHIP.find("ZDOTDIR=${MI_ORIG_ZDOTDIR:-$HOME}").unwrap() < ZSHRC_CHIP.find("source").unwrap());
+        assert!(ZSHRC_CHIP.contains("source \"${MI_ORIG_ZDOTDIR:-$HOME}/.zshrc\""));
+        assert!(ZSHRC_CHIP.contains("PROMPT=$'%F{244}%~%f\\n%F{4}❯%f '"));
+        assert!(ZSHRC_CHIP.contains("ZDOTDIR=${MI_ORIG_ZDOTDIR:-$HOME}"));
+        assert!(ZSHRC_CHIP.find("source").unwrap() < ZSHRC_CHIP.find("\nPROMPT=").unwrap());
+        assert_eq!(zsh_forward(".zshenv"), "[[ -r \"${MI_ORIG_ZDOTDIR:-$HOME}/.zshenv\" ]] && source \"${MI_ORIG_ZDOTDIR:-$HOME}/.zshenv\"\n");
+    }
+    #[test]
     fn drop_mata_al_hijo() {
         let marca = "sleep 98765";
-        let s = Session::spawn(Some(vec!["sh".into(), "-c".into(), format!("exec {marca}")]), || {}, || {});
+        let s = Session::spawn(Some(vec!["sh".into(), "-c".into(), format!("exec {marca}")]), None, || {}, || {});
         let vivo = || std::process::Command::new("pgrep").args(["-f", marca]).output().unwrap().status.success();
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(vivo());
         drop(s);
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(!vivo());
+    }
+    #[test]
+    fn cwd_sin_permiso_no_hace_panic() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join("mi-terminal-sinperm");
+        let _ = std::fs::create_dir_all(&d);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let s = Session::spawn(Some(vec!["sleep".into(), "98766".into()]), Some(d.clone()), || {}, || {});
+        assert!(s.child_pid.is_some());
+        drop(s);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir(&d);
     }
     #[test]
     fn colores() {
@@ -254,6 +368,29 @@ mod tests {
         assert_eq!(click_move_bytes((0, 8), (1, 2), 10, false), b"\x1b[C".repeat(4));
         assert_eq!(click_move_bytes((1, 2), (0, 8), 10, false), b"\x1b[D".repeat(4));
         assert!(click_move_bytes((0, 5), (0, 5), 10, false).is_empty());
+    }
+    #[test]
+    fn ctrl_v_llega_al_shell() {
+        assert_eq!(key_bytes(Key::Char('v'), Mods { shift: false, alt: false, ctrl: true }, false), Some(vec![0x16]));
+    }
+    #[test]
+    fn ruta_soltada() {
+        assert_eq!(drop_path_text("/a/b c/d (1).png"), "/a/b\\ c/d\\ \\(1\\).png ");
+        assert_eq!(drop_path_text("/tmp/it's;$x\n"), "/tmp/it\\'s\\;\\$x ");
+        assert_eq!(drop_path_text("/Users/ñu/a-b_c.txt"), "/Users/ñu/a-b_c.txt ");
+    }
+    #[test]
+    fn historial_no_depende_de_total_lines() {
+        // Size(80,24) tiene total_lines == screen_lines: aun así el historial se llena (Term usa scrolling_history).
+        use alacritty_terminal::event::VoidListener;
+        let mut t = Term::new(Config { scrolling_history: SCROLLBACK, ..Config::default() }, &Size(80, 24), VoidListener);
+        let mut p: Processor = Processor::new();
+        for i in 1..=200 { p.advance(&mut t, format!("linea {i}\r\n").as_bytes()); }
+        assert!(t.history_size() > 100, "history_size={}", t.history_size());
+        t.resize(Size(100, 30));
+        assert!(t.history_size() > 100);
+        t.scroll_display(alacritty_terminal::grid::Scroll::Delta(5));
+        assert_eq!(t.grid().display_offset(), 5);
     }
     #[test]
     fn pegado() {
