@@ -2029,14 +2029,22 @@ function run(argv) {
   const img = $.NSImage.alloc.initWithContentsOfFile(argv[0]);
   if (img.isNil() || !img.isValid) return 'sin imagen';
   $.NSApplication.sharedApplication.setActivationPolicy(1);
-  const s = img.size, k = Math.min(1, 520 / Math.max(s.width, s.height)), w = s.width * k, h = s.height * k;
   const m = $.NSEvent.mouseLocation, v = $.NSScreen.mainScreen.visibleFrame;
+  const max = Math.min(320, v.size.height * 0.4), pad = 8;
+  const s = img.size, k = Math.min(1, max / Math.max(s.width, s.height)), iw = s.width * k, ih = s.height * k;
+  const w = iw + 2 * pad, h = ih + 2 * pad;
   const x = Math.max(v.origin.x, Math.min(m.x + 16, v.origin.x + v.size.width - w));
   const y = m.y + 16 + h <= v.origin.y + v.size.height ? m.y + 16 : Math.max(v.origin.y, m.y - 16 - h);
   const p = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(x, y, w, h), 128, 2, false);
   p.level = 25; p.ignoresMouseEvents = true; p.hasShadow = true;
-  const view = $.NSImageView.alloc.initWithFrame($.NSMakeRect(0, 0, w, h));
-  view.image = img; view.imageScaling = 3; p.contentView = view; p.orderFrontRegardless;
+  const color = (r, g, b) => $.NSColor.colorWithSRGBRedGreenBlueAlpha(r / 255, g / 255, b / 255, 1);
+  p.opaque = false; p.backgroundColor = $.NSColor.clearColor;
+  const box = $.NSBox.alloc.initWithFrame($.NSMakeRect(0, 0, w, h));
+  box.boxType = 4; box.titlePosition = 0; box.cornerRadius = 10; box.borderWidth = 1;
+  box.fillColor = color(22, 22, 26); box.borderColor = color(58, 58, 66); box.contentViewMargins = $.NSMakeSize(0, 0);
+  const view = $.NSImageView.alloc.initWithFrame($.NSMakeRect(pad - 1, pad - 1, iw, ih));
+  view.image = img; view.imageScaling = 3; box.contentView.addSubview(view);
+  p.contentView = box; p.orderFrontRegardless;
   $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(60));
 }";
 
