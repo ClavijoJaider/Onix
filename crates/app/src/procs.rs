@@ -45,6 +45,21 @@ pub fn parse_vm_stat(out: &str) -> Option<u64> {
     Some((get("Pages active")? + get("Pages wired down")? + get("Pages occupied by compressor")?) * page)
 }
 
+extern "C" {
+    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+    fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+}
+
+/// (memoria en KB como Monitor de Actividad, CPU acumulada en unidades mach); None en procesos de otros usuarios.
+fn usage(pid: i32) -> Option<(u64, u64)> {
+    let mut b = [0u64; 24];
+    // SAFETY: rusage_info_v2 (flavor 2) son 20 u64 y cabe en `b`; 2 = user, 3 = system, 9 = phys_footprint.
+    (unsafe { proc_pid_rusage(pid, 2, b.as_mut_ptr()) } == 0).then(|| (b[9] / 1024, b[2] + b[3]))
+}
+
+/// % de un núcleo gastado entre dos lecturas separadas `secs`; `tick_ns`: nanosegundos por unidad mach.
+fn cpu_pct(before: u64, now: u64, tick_ns: f64, secs: f64) -> f32 { (now.saturating_sub(before) as f64 * tick_ns / (secs * 1e9) * 100.0) as f32 }
+
 /// Total de CPU del sistema: suma de pcpu / núcleos, tope 100.
 pub fn sys_cpu(ps: &[Proc], ncpu: u32) -> f32 { (ps.iter().map(|p| p.cpu).sum::<f32>() / ncpu.max(1) as f32).min(100.0) }
 
@@ -113,20 +128,36 @@ impl Mon {
             let num = |c, a: &[&str]| run(c, a, 3).and_then(|s| s.trim().parse::<u64>().ok());
             let (ncpu, total) = (num("sysctl", &["-n", "hw.ncpu"]).unwrap_or(1) as u32, num("sysctl", &["-n", "hw.memsize"]).unwrap_or(0));
             let (mut last_ps, mut last_lsof): (Option<Instant>, Option<Instant>) = (None, None);
+            let mut tb = [1u32; 2];
+            // SAFETY: mach_timebase_info escribe dos u32 (numerador y denominador).
+            unsafe { mach_timebase_info(&mut tb) };
+            let tick_ns = tb[0] as f64 / tb[1].max(1) as f64;
+            // Lectura anterior de CPU de cada proceso propio.
+            let mut prev: HashMap<i32, (u64, Instant)> = HashMap::new();
             loop {
                 // Apagado: duerme hasta `set(true)` (unpark) en vez de despertar cada 500 ms.
-                if !on.load(Ordering::Relaxed) { (last_ps, last_lsof) = (None, None); std::thread::park(); continue; }
-                std::thread::sleep(Duration::from_millis(500));
-                if last_ps.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+                if !on.load(Ordering::Relaxed) { (last_ps, last_lsof) = (None, None); prev.clear(); std::thread::park(); continue; }
+                std::thread::sleep(Duration::from_secs(1));
+                if last_ps.is_none_or(|t| t.elapsed() >= Duration::from_secs(3)) {
                     last_ps = Some(Instant::now());
-                    if let Some(p) = run("ps", &["-axo", "pid,ppid,uid,pcpu,rss,comm"], 3).map(|s| parse_ps(&s)) {
+                    if let Some(mut p) = run("ps", &["-axo", "pid,ppid,uid,pcpu,rss,comm"], 3).map(|s| parse_ps(&s)) {
                         // shortcut: si vm_stat falla, la RAM usada es la suma de rss.
                         let used = run("vm_stat", &[], 3).and_then(|s| parse_vm_stat(&s)).unwrap_or_else(|| p.iter().map(|x| x.rss_kb * 1024).sum());
+                        // Propios: memoria y CPU del intervalo, como Monitor de Actividad. Ajenos: macOS no deja leerlos, quedan las cifras de ps.
+                        let mut next = HashMap::new();
+                        for x in &mut p {
+                            let Some((kb, ticks)) = usage(x.pid) else { continue };
+                            let now = Instant::now();
+                            x.rss_kb = kb;
+                            if let Some(&(t0, at)) = prev.get(&x.pid) { x.cpu = cpu_pct(t0, ticks, tick_ns, (now - at).as_secs_f64()); }
+                            next.insert(x.pid, (ticks, now));
+                        }
+                        prev = next;
                         let mut s = snap.lock().unwrap();
                         (s.cpu, s.used, s.total, s.procs) = (sys_cpu(&p, ncpu), used, total, p);
                     }
                 }
-                if last_lsof.is_none_or(|t| t.elapsed() >= Duration::from_secs(6)) {
+                if last_lsof.is_none_or(|t| t.elapsed() >= Duration::from_secs(15)) {
                     last_lsof = Some(Instant::now());
                     let ports = run("lsof", &["-iTCP", "-sTCP:LISTEN", "-nP"], 4).map(|s| parse_lsof(&s)).unwrap_or_default();
                     snap.lock().unwrap().ports = ports;
@@ -178,6 +209,15 @@ mod tests {
         assert!(rows(&p, &ports, Sort::Cpu, "zzz").is_empty());
         let muchos: Vec<Proc> = (2..200).map(|i| Proc { pid: i, ppid: 1, uid: 501, cpu: 0.0, rss_kb: 1, name: "x".into() }).collect();
         assert_eq!(rows(&muchos, &HashMap::new(), Sort::Cpu, "").len(), MAX_ROWS);
+    }
+    #[test]
+    fn memoria_y_cpu_como_el_monitor() {
+        let (kb, _) = usage(std::process::id() as i32).unwrap();
+        assert!(kb > 500 && kb < 4 << 20, "{kb}");
+        assert_eq!(usage(-1), None);
+        // 24 M unidades de 125/3 ns = 1 s de CPU en 2 s = 50 %.
+        assert!((cpu_pct(0, 24_000_000, 125.0 / 3.0, 2.0) - 50.0).abs() < 0.01);
+        assert_eq!(cpu_pct(10, 5, 1.0, 1.0), 0.0);
     }
     #[test]
     fn cadena_y_can_stop() {

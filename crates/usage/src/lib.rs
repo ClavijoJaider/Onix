@@ -6,6 +6,8 @@
 //! parcial (7 casos), donde la última línea trae el mayor output_tokens. Criterio:
 //! una entrada por requestId (global, entre archivos), conservando la de mayor
 //! output_tokens (empate: la última). Sin requestId se usa message.id.
+pub mod stats;
+
 use chrono::{DateTime, Local, NaiveDate};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -61,6 +63,12 @@ impl Usage {
 #[derive(Clone, Debug)]
 pub struct Record {
     pub day: NaiveDate,
+    /// Hora local de la respuesta.
+    pub at: DateTime<Local>,
+    /// Sesión (id del jsonl; los subagentes cuentan en la sesión que los lanzó).
+    pub session: String,
+    /// true si la línea vino de un subagente.
+    pub sub: bool,
     pub model: String,
     pub project: String,
     pub usage: Usage,
@@ -72,6 +80,7 @@ pub struct Scan {
     pub invalid: u64,
     pub duplicates: u64,
     unkeyed: u64,
+    cur: (String, bool),
 }
 
 impl Scan {
@@ -93,8 +102,9 @@ impl Scan {
             self.invalid += 1;
             return;
         };
+        let at = t.with_timezone(&Local);
         let rec = Record {
-            day: t.with_timezone(&Local).date_naive(),
+            day: at.date_naive(), at, session: self.cur.0.clone(), sub: self.cur.1,
             model: m.model.unwrap_or_else(|| "?".into()),
             project: l.cwd.unwrap_or_else(|| "?".into()),
             usage,
@@ -125,6 +135,7 @@ impl Scan {
                 continue;
             }
             let Ok(f) = File::open(e.path()) else { continue };
+            self.cur = session_of(e.path());
             let mut r = BufReader::new(f);
             let mut buf = String::new();
             // read_line (no lines()): una línea con UTF-8 inválido no aborta el archivo.
@@ -141,6 +152,16 @@ impl Scan {
             }
         }
     }
+}
+
+/// (sesión, es_subagente) de un jsonl: `<id>.jsonl` o `<id>/subagents/<x>.jsonl`.
+pub fn session_of(p: &Path) -> (String, bool) {
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let parent = p.parent();
+    if parent.and_then(|d| d.file_name()).is_some_and(|n| n == "subagents") {
+        if let Some(id) = parent.and_then(|d| d.parent()).and_then(|d| d.file_name()) { return (id.to_string_lossy().into_owned(), true); }
+    }
+    (stem, false)
 }
 
 #[derive(Default, Debug)]
@@ -186,5 +207,10 @@ mod tests {
         assert_eq!(g[0].0, "claude-x");
         assert_eq!(g[0].1.usage.total(), 2 + 30 + 100 + 1000);
         assert_eq!(g[1].1.usage.cache_read_input_tokens, 0);
+    }
+    #[test]
+    fn sesion_de_archivo() {
+        assert_eq!(session_of(Path::new("/x/proj/abc.jsonl")), ("abc".into(), false));
+        assert_eq!(session_of(Path::new("/x/proj/abc/subagents/agent-1.jsonl")), ("abc".into(), true));
     }
 }

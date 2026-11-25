@@ -6,10 +6,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STATE="$HOME/.cache/mi-terminal-autobuild"
 LOG="$HOME/Library/Logs/mi-terminal-build.log"
 APPS="$HOME/Applications"
-APP="$APPS/MiTerminal.app"
+APP="$APPS/Onix.app"
 mkdir -p "$STATE" "$APPS" "$(dirname "$LOG")"
 
-notify() { osascript -e "display notification \"$1\" with title \"Mi Terminal\"" >/dev/null 2>&1; }
+notify() { osascript -e "display notification \"$1\" with title \"Ónix\"" >/dev/null 2>&1; }
 
 # lock anti-simultáneo (mkdir es atómico); recupera locks de procesos muertos
 LOCK="$STATE/build.lock"
@@ -34,20 +34,20 @@ if ! nice cargo build --release; then
 fi
 
 TMP="$(mktemp -d "$APPS/.mt-build.XXXXXX")" || exit 1
-N="$TMP/MiTerminal.app"
+N="$TMP/Onix.app"
 mkdir -p "$N/Contents/MacOS" "$N/Contents/Resources"
 ICON="$ROOT/crates/app/assets/AppIcon.icns"
 [ -f "$ICON" ] || python3 "$ROOT/scripts/make-icon.py" "$ICON" || exit 1
 cp "$ICON" "$N/Contents/Resources/AppIcon.icns" || exit 1
-cp "${CARGO_TARGET_DIR:-$ROOT/target}/release/mi-terminal" "$N/Contents/MacOS/mi-terminal" || exit 1
+cp "${CARGO_TARGET_DIR:-$ROOT/target}/release/onix" "$N/Contents/MacOS/onix" || exit 1
 cat > "$N/Contents/Info.plist" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>com.mi-terminal.app</string>
-<key>CFBundleExecutable</key><string>mi-terminal</string>
+<key>CFBundleExecutable</key><string>onix</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
-<key>CFBundleName</key><string>MiTerminal</string>
+<key>CFBundleName</key><string>Ónix</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>NSHighResolutionCapable</key><true/>
@@ -62,11 +62,11 @@ rm -rf "$APP.old"
 [ -e "$APP" ] && { mv "$APP" "$APP.old" || exit 1; }
 if ! mv "$N" "$APP"; then
   [ -e "$APP.old" ] && mv "$APP.old" "$APP"
-  echo "REEMPLAZO FALLIDO"; notify "No se pudo reemplazar MiTerminal.app"; exit 1
+  echo "REEMPLAZO FALLIDO"; notify "No se pudo reemplazar Onix.app"; exit 1
 fi
 rm -rf "$APP.old"
 echo "$FP" > "$STATE/last-fingerprint"
 rm -f "$STATE/last-failed-fingerprint"
 echo "OK app actualizada"
-if pgrep -x mi-terminal >/dev/null; then notify "Hay versión nueva de Mi Terminal, reábrela"; fi
+if pgrep -x onix >/dev/null; then notify "Hay versión nueva de Ónix, reábrela"; fi
 exit 0

@@ -1,3 +1,13 @@
 [workspace]
 members = ["crates/*"]
 resolver = "2"
+
+# Binario más pequeño y rápido (compila más lento).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Sin símbolos de depuración: la caché de pruebas ocupa mucho menos.
+[profile.dev]
+debug = false

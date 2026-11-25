@@ -9,11 +9,11 @@ const GROUP_H: f32 = 26.0;
 pub const ARCH_H: f32 = 20.0;
 pub const ARCH_MAX: usize = 6;
 
-/// Filas de la lista Archived abierta: (título a 24 car., "proyecto · hace 3m"), más recientes primero.
+/// Filas de la lista Archived abierta: (título a 22 car., "hace 3m"), más recientes primero.
 pub fn archived_rows(a: &[Archived], now: std::time::SystemTime) -> Vec<(String, String)> {
     a.iter().rev().take(ARCH_MAX).map(|x| {
         let secs = now.duration_since(x.at).map_or(0, |d| d.as_secs());
-        (clean_title(&x.title, 24), format!("{} {}", x.project, fmt_elapsed(secs)))
+        (clean_title(&x.title, 22), fmt_elapsed(secs))
     }).collect()
 }
 /// y lógica de la fila `k` de `n` filas de Archived abierta (se apilan justo sobre los íconos de lanzamiento).
@@ -47,28 +47,33 @@ fn parse_procargs(b: &[u8]) -> Vec<String> {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Agent { Claude, Codex, Gemini, Grok, Opencode, Junie, Shell }
+pub enum Agent { Claude, Codex, Antigravity, Grok, Opencode, Junie, Shell }
 
 /// Íconos de lanzamiento (orden de la fila inferior) y su binario.
 pub const LAUNCH: [(Agent, &str); 6] = [
     (Agent::Claude, "claude"), (Agent::Codex, "codex"), (Agent::Grok, "grok"),
-    (Agent::Gemini, "gemini"), (Agent::Junie, "junie"), (Agent::Opencode, "opencode"),
+    (Agent::Antigravity, "agy"), (Agent::Junie, "junie"), (Agent::Opencode, "opencode"),
 ];
 
 impl Agent {
     /// Glifo de texto (solo Shell; los agentes llevan logo, ver `icon`).
     pub fn glyph(self) -> &'static str { "❯" }
+    /// Nombre que se muestra en la pestaña ("claude", "codex", "antigravity"…); Shell no tiene.
+    pub fn name(self) -> Option<&'static str> {
+        if self == Agent::Antigravity { return Some("antigravity"); }
+        LAUNCH.iter().find(|(g, _)| *g == self).map(|(_, b)| *b)
+    }
     /// (id, máscara alfa 64x64) del logo de marca; Shell no tiene.
     pub fn icon(self) -> Option<(u16, &'static [u8])> {
         macro_rules! m { ($i:expr, $f:literal) => { Some(($i, &include_bytes!(concat!("../assets/icons/", $f, ".a8"))[..])) } }
         match self {
-            Agent::Claude => m!(0, "claude"), Agent::Codex => m!(1, "openai"), Agent::Gemini => m!(2, "googlegemini"),
+            Agent::Claude => m!(0, "claude"), Agent::Codex => m!(1, "openai"), Agent::Antigravity => m!(2, "googlegemini"),
             Agent::Grok => m!(3, "grok"), Agent::Opencode => m!(4, "opencode"), Agent::Junie => m!(5, "jetbrains"), Agent::Shell => None,
         }
     }
     pub fn color(self) -> [u8; 3] {
         match self {
-            Agent::Claude => [0xd9, 0x77, 0x57], Agent::Gemini => [0x8e, 0x75, 0xb2], Agent::Shell => [0x8a, 0x8a, 0x94],
+            Agent::Claude => [0xd9, 0x77, 0x57], Agent::Antigravity => [0x8e, 0x75, 0xb2], Agent::Shell => [0x8a, 0x8a, 0x94],
             _ => [0xee, 0xee, 0xee],
         }
     }
@@ -143,7 +148,9 @@ pub fn raster_icon(id: u16, w: u16, h: u16) -> Option<Vec<u8>> {
 /// Un CLI de node ("node …/claude") aparece como `node`: Pane::refresh usa `agent_from_args` con su argv.
 pub fn agent_from(name: &str, path: &str) -> Agent {
     let s = format!("{name} {path}").to_lowercase();
-    LAUNCH.iter().find(|(_, b)| s.contains(b)).map_or(Agent::Shell, |(a, _)| *a)
+    // Nombres cortos (agy) solo por coincidencia exacta del binario, para no confundirlos con otras palabras.
+    let hit = |b: &str| name == b || path.ends_with(&format!("/{b}")) || (b.len() > 3 && s.contains(b));
+    LAUNCH.iter().find(|(_, b)| hit(b)).map_or(Agent::Shell, |(a, _)| *a)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -231,7 +238,7 @@ pub fn is_uuid(s: &str) -> bool {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum Hit { New, Folder, Search, Filter(Filter), Group(usize), Row(usize), Launch(usize), Archived }
+pub enum Hit { New, Folder, Search, Filter(Filter), Group(usize), Row(usize), Launch(usize), Archived, ArchRow(usize), ArchDel(usize) }
 
 /// Rects (px) de todo lo interactivo/dibujable de la barra para una ventana de `win` px y escala `sc`.
 /// `Group(i)`/`Row(j)`: `i` indexa `items`, `j` indexa las entradas; solo lo que cabe en la lista.
@@ -254,6 +261,12 @@ pub fn layout(win: (f32, f32), sc: f32, items: &[Item], arch: usize) -> Vec<(R, 
     }
     for i in 0..LAUNCH.len() { v.push(((10.0 + i as f32 * 36.0, h - 76.0, 30.0, 28.0), Hit::Launch(i))); }
     v.push(((8.0, h - 40.0, SIDE_W - 16.0, 28.0), Hit::Archived));
+    // `k` cuenta desde la fila de arriba (la archivada más reciente): clic = reabrir, × = borrar.
+    for k in 0..arch {
+        let y = arch_y(h, arch, k);
+        v.push(((8.0, y, SIDE_W - 42.0, ARCH_H), Hit::ArchRow(k)));
+        v.push(((SIDE_W - 32.0, y, 24.0, ARCH_H), Hit::ArchDel(k)));
+    }
     v.into_iter().map(|((x, y, w, h), k)| ((x * sc, y * sc, w * sc, h * sc), k)).collect()
 }
 
@@ -264,9 +277,20 @@ pub fn hit_at(l: &[(R, Hit)], m: (f32, f32)) -> Option<Hit> {
 /// ¿`bin` está en PATH (o en carpetas habituales de CLIs)?
 pub fn on_path(bin: &str) -> bool {
     let home = std::env::var("HOME").unwrap_or_default();
-    let extra = [format!("{home}/.local/bin"), format!("{home}/.cargo/bin"), format!("{home}/.bun/bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()];
+    let extra = [format!("{home}/.local/bin"), format!("{home}/.cargo/bin"), format!("{home}/.bun/bin"), format!("{home}/.npm-global/bin"), format!("{home}/.opencode/bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()];
     let path = std::env::var("PATH").unwrap_or_default();
-    path.split(':').map(str::to_string).chain(extra).any(|d| std::path::Path::new(&d).join(bin).is_file())
+    let login = LOGIN_PATH.get().cloned().unwrap_or_default();
+    path.split(':').chain(login.split(':')).map(str::to_string).chain(extra).filter(|d| !d.is_empty()).any(|d| std::path::Path::new(&d).join(bin).is_file())
+}
+
+/// PATH del shell de login del usuario (lo que ve en su terminal); se lee una vez en segundo plano.
+pub static LOGIN_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+pub fn load_login_path() {
+    std::thread::spawn(|| {
+        let out = std::process::Command::new("/bin/zsh").args(["-lic", "print -r -- $PATH"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
+        let p = out.ok().map(|o| String::from_utf8_lossy(&o.stdout).lines().last().unwrap_or("").trim().to_string()).unwrap_or_default();
+        let _ = LOGIN_PATH.set(p);
+    });
 }
 
 extern "C" {
@@ -291,8 +315,28 @@ pub fn proc_info(pid: i32) -> (String, String, String) {
     (cstr(&n), cstr(&p), cwd)
 }
 
-/// Sesión cerrada, guardada en memoria.
-pub struct Archived { pub title: String, pub project: String, pub at: std::time::SystemTime }
+/// Sesión de agente cerrada. `token` es lo que permite reabrirla (UUID de Claude o el binario de otro agente).
+#[derive(Debug, PartialEq)]
+pub struct Archived { pub title: String, pub project: String, pub cwd: String, pub token: String, pub at: std::time::SystemTime }
+
+/// ¿Sirve para reabrir una sesión? Es lo único que llega a un comando.
+pub fn valid_token(t: &str) -> bool { is_uuid(t) || LAUNCH.iter().any(|(a, b)| *a != Agent::Claude && *b == t) }
+
+pub fn archived_to_json(a: &[Archived]) -> String {
+    let secs = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    serde_json::Value::Array(a.iter().map(|x| serde_json::json!({"title": x.title, "project": x.project, "cwd": x.cwd, "token": x.token, "at": secs(x.at)})).collect()).to_string()
+}
+
+/// Descarta entradas incompletas, con ruta no absoluta o token inválido.
+pub fn archived_from_json(t: &str) -> Vec<Archived> {
+    let Ok(serde_json::Value::Array(v)) = serde_json::from_str(t) else { return vec![] };
+    v.iter().filter_map(|x| {
+        let s = |k: &str| x.get(k)?.as_str().map(String::from);
+        let at = std::time::UNIX_EPOCH.checked_add(Duration::from_secs(x.get("at")?.as_u64()?))?;
+        let a = Archived { title: s("title")?, project: s("project")?, cwd: s("cwd")?, token: s("token")?, at };
+        (a.cwd.starts_with('/') && valid_token(&a.token)).then_some(a)
+    }).collect()
+}
 
 /// Panel "Agents": filas = agentes abiertos (no Shell), working primero y luego los más recientes.
 pub fn agent_rows(es: Vec<Entry>) -> Vec<Entry> {
@@ -372,11 +416,11 @@ mod tests {
     fn archived_recientes_primero_y_recorta() {
         use std::time::{Duration as D, SystemTime as T};
         let now = T::UNIX_EPOCH + D::from_secs(1000);
-        let a: Vec<Archived> = (0..8).map(|i| Archived { title: "x".repeat(40), project: format!("p{i}"), at: now - D::from_secs(60 * (8 - i)) }).collect();
+        let a: Vec<Archived> = (0..8).map(|i| Archived { title: "x".repeat(40), project: format!("p{i}"), cwd: "/x".into(), token: "codex".into(), at: now - D::from_secs(60 * (8 - i)) }).collect();
         let r = archived_rows(&a, now);
         assert_eq!(r.len(), ARCH_MAX);
-        assert_eq!(r[0].1, "p7 1m");
-        assert_eq!(r[0].0.chars().count(), 24);
+        assert_eq!(r[0].1, "1m");
+        assert_eq!(r[0].0.chars().count(), 22);
         assert!(arch_y(1000.0, 6, 0) < arch_y(1000.0, 6, 5));
     }
     #[test]
@@ -445,6 +489,10 @@ mod tests {
         assert_eq!(status(Agent::Claude, true, r, "◑ Refactor"), Status::Working);
         assert_eq!(status(Agent::Codex, true, q, "codex"), Status::Working);
         assert_eq!(status(Agent::Codex, true, r, "codex"), Status::Waiting);
+    }
+    #[test]
+    fn nombre_de_agente() {
+        assert_eq!((Agent::Claude.name(), Agent::Codex.name(), Agent::Antigravity.name(), Agent::Shell.name()), (Some("claude"), Some("codex"), Some("antigravity"), None));
     }
     #[test]
     fn ruta_con_tilde() {
