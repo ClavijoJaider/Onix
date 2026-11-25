@@ -2,16 +2,9 @@
 
 Ónix es una terminal para macOS escrita en Rust, pensada para trabajar con agentes de código como Claude Code. Es liviana, tiene tema oscuro y no envía telemetría ni se conecta a la red por su cuenta. Los programas que ejecutes dentro sí pueden hacerlo.
 
-## Qué trae
-
-- Pestañas y hasta dos paneles lado a lado.
-- Una barra lateral con tus sesiones agrupadas por proyecto, con su estado y un buscador.
-- Reconoce Claude Code, Codex, Antigravity, Grok, opencode y Junie. Cada uno se instala aparte y usa tu propia cuenta.
-- Al reabrir la app vuelven tus pestañas. Las pestañas con agente que cierres quedan en "Archived" para retomarlas.
-- Un chat de Claude Code que lleve 15 minutos esperando se puede dormir para liberar memoria. Se retoma con Enter.
-- El panel "Agent usage" muestra tokens, tareas, tiempo y horas de más actividad. Por ahora solo cuenta el uso de Claude Code.
-
 En mediciones del 25 de noviembre de 2026, con la ventana a pantalla completa en un Mac Retina, usó entre 56 y 89 MB de memoria.
+
+![Ónix con Claude Code abierto, la barra lateral de sesiones y las barras de contexto y de uso](docs/principal.png)
 
 ## Instalación
 
@@ -24,6 +17,79 @@ scripts/build-app.sh
 ```
 
 La app queda en `~/Applications/Onix.app`. El resultado de la compilación se guarda en `~/Library/Logs/mi-terminal-build.log`.
+
+## Imágenes, archivos y rutas
+
+![Vista previa de una imagen al pasar el ratón sobre su ruta](docs/imagen.png)
+
+Cuando en la terminal aparece la ruta de un archivo o carpeta que existe, Ónix la reconoce. Sirven las rutas completas, las que empiezan por `~/`, las `file://` y las relativas a la carpeta actual. Las direcciones web no se abren con clic.
+
+| Acción | Resultado |
+|---|---|
+| Pasar el ratón sobre una imagen o documento | La subraya y muestra una vista previa flotante |
+| Clic en una ruta | La muestra en el Finder |
+| ⌘ clic en una imagen | La abre en Vista Previa |
+| ⌘ clic en un documento | Lo abre con su app |
+| Arrastrar un archivo a la ventana | Escribe su ruta, lista para usar en el shell |
+| ⌘V con una imagen en el portapapeles | La guarda como PNG y pega su ruta |
+
+La vista previa funciona con imágenes (PNG, JPG, GIF, WebP, HEIC, BMP y TIFF) y con PDF, Word, Excel, PowerPoint, Pages, Numbers, Keynote, texto, Markdown, CSV, MP4 y MOV.
+
+En Claude Code, las marcas `[Image #1]` de las imágenes que pegas se pintan de naranja. Puedes verlas al pasar el ratón y abrirlas igual que cualquier otra imagen.
+
+## Claude Code dentro de Ónix
+
+Ónix ajusta cómo se ve Claude Code sin cambiar lo que el programa envía ni lo que copias:
+
+- Muestra el consumo de contexto como una barra fina sobre el cuadro de escritura. Cambia de color al llegar al 60 % y al 80 %.
+- Junta la línea de uso con la línea del modo (por ejemplo "auto mode on") cuando caben en la misma fila.
+- Oculta la ayuda "(shift+tab to cycle)" y el nombre de sesión repetido sobre el cuadro de escritura.
+- Mantiene el cuadro de escritura abajo cuando se cierra un diálogo.
+- Limpia el historial de la pantalla después de `/clear`.
+- Dibuja las líneas, bloques y símbolos de su interfaz para que encajen bien en la cuadrícula.
+
+## Pestañas y paneles
+
+Cada pestaña admite hasta dos paneles lado a lado. El separador se arrastra con el ratón y con doble clic vuelve a la mitad. El título muestra la carpeta y el agente que está corriendo, y si es largo se desplaza al pasar el ratón.
+
+Al hacer clic en otra posición de la línea que estás escribiendo, el cursor se mueve hasta allí. Si subiste en el historial, el botón "Jump to bottom" te devuelve al final. Cuando un programa usa el ratón, mantén Shift para seleccionar texto.
+
+La app recuerda el tamaño y la posición de la ventana, y al abrirla vuelven tus pestañas. Si tu zsh no tiene un tema propio, Ónix muestra la carpeta en una línea y el cursor debajo.
+
+## Barra lateral
+
+Agrupa tus sesiones por proyecto y muestra el estado de cada una y hace cuánto cambió. Puedes filtrarlas por "All", "Waiting" o "Working" y buscarlas con `/`. Desde ahí también se crea una sesión nueva o se elige una carpeta.
+
+Los íconos de abajo lanzan en la carpeta actual los agentes que tengas instalados: Claude Code, Codex, Antigravity, Grok, opencode y Junie. Cada uno se instala aparte y usa tu propia cuenta.
+
+Las pestañas con agente que cierres pasan a "Archived". Un clic las reabre y la × las quita de la lista, sin borrar los archivos del agente. Claude Code retoma la sesión exacta; en los demás agentes depende de lo que permita cada uno.
+
+Un chat de Claude Code en una pestaña oculta que lleve 15 minutos esperando, sin tareas pendientes ni texto a medio escribir, se duerme para liberar memoria. Se retoma con Enter.
+
+## Agentes, procesos y consumo
+
+La lista de agentes (⇧⌘A) muestra los que están abiertos. Con las flechas eliges uno, con Enter vas a él y con `s` dos veces le envías Ctrl+C.
+
+La lista de procesos (⇧⌘P) muestra CPU, memoria y puertos en escucha. Puedes escribir para filtrar, ordenar con Tab y saltar al panel de un proceso con Enter. Para detener uno de tus procesos, pulsa ⌘⌫ y confirma con Enter.
+
+El panel "Agent usage" (⇧⌘U) muestra tokens por día y por modelo, tareas, tiempo y un mapa de las horas de más actividad, para 7, 30 o 90 días o todo el historial. Por ahora solo cuenta el uso de Claude Code.
+
+## Plugins de la línea de estado
+
+Son opcionales, necesitan `python3` y se encuentran en [`plugins`](plugins/README.md).
+
+| Plugin | Qué muestra |
+|---|---|
+| `contexto` | Porcentaje de contexto consumido en la sesión |
+| `week` | Uso de las últimas 5 horas y de la semana, con el tiempo para reiniciarse. También pone el nombre de la sesión en la pestaña |
+
+Para activarlos, agrega esto a `~/.claude/settings.json` y cambia la ruta por la carpeta donde clonaste el proyecto:
+
+```json
+"statusLine": { "type": "command", "command": "python3 ~/Onix/plugins/statusline.py" }
+```
+
+Para crear otro plugin, añade una carpeta en `plugins` con un archivo `linea.py` que lea el JSON de Claude Code e imprima su texto. Los plugins se unen en orden alfabético.
 
 ## Atajos
 
@@ -45,11 +111,7 @@ La app queda en `~/Applications/Onix.app`. El resultado de la compilación se gu
 
 ## Tus datos
 
-Ónix lee los archivos de `~/.claude` para mostrar las sesiones y las cifras de uso, sin modificarlos. Lo suyo lo guarda en `~/Library/Application Support/mi-terminal`.
-
-## Línea de estado para Claude Code
-
-La carpeta [`plugins`](plugins/README.md) trae una línea de estado opcional con el contexto consumido y los límites de uso. Si clonaste el proyecto en otra carpeta, ajusta la ruta que aparece en sus instrucciones.
+Ónix lee los archivos de Claude Code para mostrar las sesiones, las imágenes pegadas y las cifras de uso, sin modificarlos. Sus datos quedan en `~/Library/Application Support/mi-terminal` y las imágenes temporales en `~/Library/Caches/mi-terminal`.
 
 ## Desarrollo
 
