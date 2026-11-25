@@ -1,0 +1,8 @@
+[workspace]
+members = ["app", "term-core", "usage"]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
