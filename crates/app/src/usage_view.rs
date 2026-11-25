@@ -6,14 +6,32 @@ use usage::stats::{self, Stats};
 
 pub type R = (f32, f32, f32, f32);
 pub type Rgb = [u8; 3];
-/// (texto, x, y, color, tamaño en px lógicos, negrita)
-pub type Txt = (String, f32, f32, Rgb, f32, bool);
+/// (texto, x, y, color, tamaño en px lógicos, negrita, `x` es el borde derecho)
+pub type Txt = (String, f32, f32, Rgb, f32, bool, bool);
+/// Logo de un agente: (caja px, índice en `AGENTS`).
+pub type Logo = (R, usize);
+pub const BG: Rgb = [0, 0, 0];
+/// Alto (px lógicos) de las barras de modelos y agentes.
+pub const PILL_H: f32 = 7.0;
+const PILL: Rgb = [0x14, 0x14, 0x16];
+const PILL_ON: Rgb = [0x2a, 0x2a, 0x30];
+const PILL_HOVER: Rgb = [0x1a, 0x1a, 0x20];
+const UP: Rgb = [0x14, 0x2a, 0x1a];
+const DOWN: Rgb = [0x2e, 0x16, 0x16];
+
+/// Rects que se dibujan redondeados: (¿es uno?, fondo que tiene detrás).
+pub fn rounded(c: Rgb) -> Option<Rgb> {
+    match c { CARD => Some(BG), PILL_ON | PILL_HOVER => Some(PILL), UP | DOWN => Some(CARD), _ => None }
+}
+
+/// Proveedor de un modelo -> logo (índice en `AGENTS`).
+fn logo_of(provider: &str) -> Option<usize> { match provider { "Anthropic" => Some(0), "OpenAI" => Some(1), "Google" => Some(2), "xAI" => Some(4), _ => None } }
 
 pub const RANGES: [(&str, Option<i64>); 4] = [("7 days", Some(7)), ("30 days", Some(30)), ("90 days", Some(90)), ("All", None)];
 
 const DIM: Rgb = [0x8a, 0x8a, 0x94];
 const LIT: Rgb = [0xe6, 0xe6, 0xea];
-const CARD: Rgb = [0x12, 0x12, 0x15];
+const CARD: Rgb = [0x16, 0x16, 0x18];
 const LINE: Rgb = [0x26, 0x26, 0x2c];
 const GRAY: Rgb = [0x4a, 0x4a, 0x52];
 const BLUE: Rgb = [0x4a, 0x9e, 0xff];
@@ -89,34 +107,62 @@ fn mon(d: chrono::NaiveDate) -> String {
     format!("{} {}", M[d.month0() as usize], d.day())
 }
 
+/// "claude-opus-5-5-20260101" -> "Opus 5.5"; los demás nombres quedan igual.
+fn pretty(model: &str) -> String {
+    let Some(rest) = model.strip_prefix("claude-") else { return model.into() };
+    let (mut name, mut ver) = (vec![], vec![]);
+    for p in rest.split('-') {
+        if p.chars().all(|c| c.is_ascii_digit()) { if p.len() < 8 { ver.push(p); } } else {
+            let mut c = p.chars();
+            name.push(c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect()));
+        }
+    }
+    format!("{} {}", name.join(" "), ver.join(".")).trim().into()
+}
+
+/// Raya de un encabezado, desde `from` hasta antes del texto `right` que termina en `end`.
+fn rule(out: &mut Vec<(R, Rgb)>, from: f32, end: f32, right: &str, y: f32, sc: f32) {
+    // Ancho medio de la letra del sistema a 11 px.
+    let w = end - right.chars().count() as f32 * 5.7 * sc - 10.0 * sc - from;
+    if w > 0.0 { out.push(((from, y + 7.0 * sc, w, 1.0), LINE)); }
+}
+
 /// Mini barras de una serie dentro de `r`.
-fn spark(out: &mut Vec<(R, Rgb)>, r: R, vals: &[f64], c: Rgb) {
+fn spark(out: &mut Vec<(R, Rgb)>, r: R, vals: &[f64], c: Rgb, sc: f32) {
     let max = vals.iter().cloned().fold(0.0, f64::max);
     if max <= 0.0 || vals.is_empty() { return; }
-    let bw = r.2 / vals.len() as f32;
+    // Al menos 30 casillas, pegadas a la derecha: con pocos días no salen bloques.
+    let n = vals.len().max(30);
+    let (bw, skip) = (r.2 / n as f32, n - vals.len());
     for (i, v) in vals.iter().enumerate() {
         let h = (*v / max) as f32 * r.3;
-        if h > 0.0 { out.push(((r.0 + i as f32 * bw, r.1 + r.3 - h.max(1.0), (bw - 2.0).max(1.0), h.max(1.0)), c)); }
+        if h > 0.0 { out.push(((r.0 + (skip + i) as f32 * bw, r.1 + r.3 - h.max(1.0), (bw - 2.0 * sc).max(1.0), h.max(1.0)), c)); }
     }
 }
 
 /// Rects y textos de la pantalla en el área `a` (px). `st` None = cargando.
-pub fn build(a: R, sc: f32, st: Option<&Stats>, range: usize, mouse: (f32, f32)) -> (Vec<(R, Rgb)>, Vec<Txt>) {
-    let mut rs: Vec<(R, Rgb)> = vec![(a, [0x08, 0x08, 0x0a])];
+pub fn build(a: R, sc: f32, st: Option<&Stats>, range: usize, mouse: (f32, f32)) -> (Vec<(R, Rgb)>, Vec<Txt>, Vec<Logo>) {
+    let mut rs: Vec<(R, Rgb)> = vec![(a, BG)];
+    let mut logos: Vec<Logo> = vec![];
     let mut tx: Vec<Txt> = vec![];
     let (x0, y0, w) = (a.0 + 24.0 * sc, a.1 + 16.0 * sc, a.2 - 48.0 * sc);
-    let t = |tx: &mut Vec<Txt>, s: String, x: f32, y: f32, c: Rgb, size: f32, b: bool| tx.push((s, x, y, c, size, b));
+    let t = |tx: &mut Vec<Txt>, s: String, x: f32, y: f32, c: Rgb, size: f32, b: bool| tx.push((s, x, y, c, size, b, false));
+    // Igual, pero `x` es donde termina el texto.
+    let tr = |tx: &mut Vec<Txt>, s: String, x: f32, y: f32, c: Rgb, size: f32| tx.push((s, x, y, c, size, false, true));
     t(&mut tx, "Agent usage".into(), x0, y0, LIT, 15.0, true);
-    for (r, h) in hits(a, sc) {
+    let hs = hits(a, sc);
+    if let (Some(first), Some(last)) = (hs.last(), hs.get(1)) { rs.push(((first.0 .0 - 3.0 * sc, first.0 .1 - 3.0 * sc, last.0 .0 + last.0 .2 - first.0 .0 + 6.0 * sc, first.0 .3 + 6.0 * sc), CARD)); }
+    for (r, h) in hs {
         let on = matches!(h, Hit::Range(i) if i == range);
         let hov = mouse.0 >= r.0 && mouse.0 < r.0 + r.2 && mouse.1 >= r.1 && mouse.1 < r.1 + r.3;
-        if on || hov { rs.push((r, if on { [0x2a, 0x2a, 0x30] } else { [0x1a, 0x1a, 0x20] })); }
+        if h == Hit::Close { rs.push((r, if hov { PILL_ON } else { CARD })); }
+        else if on || hov { rs.push((r, if on { PILL_ON } else { PILL_HOVER })); }
         let (label, c) = match h { Hit::Range(i) => (RANGES[i].0, if on { LIT } else { DIM }), Hit::Close => ("esc", DIM) };
         t(&mut tx, label.into(), r.0 + 10.0 * sc, r.1 + 5.0 * sc, c, 12.0, false);
     }
     let Some(s) = st else {
         t(&mut tx, "Leyendo el historial de Claude Code…".into(), x0, y0 + 22.0 * sc, DIM, 12.0, false);
-        return (rs, tx);
+        return (rs, tx, logos);
     };
     let today = s.to;
     t(&mut tx, format!("{} – today", mon(s.from)), x0, y0 + 20.0 * sc, DIM, 12.0, false);
@@ -141,12 +187,12 @@ pub fn build(a: R, sc: f32, st: Option<&Stats>, range: usize, mouse: (f32, f32))
         if let Some(d) = delta {
             let s = if d > 999 { "+999%".to_string() } else if d >= 0 { format!("+{d}%") } else { format!("{d}%") };
             let bw = (s.len() as f32 * 6.6 + 12.0) * sc;
-            rs.push(((x + cw - 14.0 * sc - bw, cy + 9.0 * sc, bw, 18.0 * sc), if d >= 0 { [0x14, 0x2a, 0x1a] } else { [0x2e, 0x16, 0x16] }));
-            t(&mut tx, s, x + cw - 14.0 * sc - bw + 6.0 * sc, cy + 11.0 * sc, if d >= 0 { GREEN } else { RED }, 11.0, false);
+            rs.push(((x + cw - 14.0 * sc - bw, cy + 9.0 * sc, bw, 18.0 * sc), if d >= 0 { UP } else { DOWN }));
+            tr(&mut tx, s, x + cw - 20.0 * sc, cy + 11.0 * sc, if d >= 0 { GREEN } else { RED }, 11.0);
         }
         t(&mut tx, big, x + 14.0 * sc, cy + 30.0 * sc, LIT, 26.0, false);
         t(&mut tx, sub, x + 14.0 * sc, cy + 64.0 * sc, DIM, 12.0, false);
-        spark(&mut rs, (x + 14.0 * sc, cy + ch - 30.0 * sc, cw - 28.0 * sc, 20.0 * sc), &series, GRAY);
+        spark(&mut rs, (x + 14.0 * sc, cy + ch - 30.0 * sc, cw - 28.0 * sc, 20.0 * sc), &series, GRAY, sc);
     }
 
     // Tokens por día (izquierda) y mapa de horas (derecha).
@@ -158,17 +204,19 @@ pub fn build(a: R, sc: f32, st: Option<&Stats>, range: usize, mouse: (f32, f32))
     t(&mut tx, "TOKENS BY DAY".into(), x0, sy, DIM, 11.0, false);
     let per_day = (c.input + c.output) / n as u64;
     let head = format!("{active} of {n} days with agents · {}/day", stats::fmt_n(per_day));
-    t(&mut tx, head.clone(), x0 + lw - head.chars().count() as f32 * 6.6 * sc, sy, DIM, 11.0, false);
-    rs.push(((x0 + 110.0 * sc, sy + 7.0 * sc, lw - 110.0 * sc - head.chars().count() as f32 * 6.6 * sc - 10.0 * sc, 1.0), LINE));
+    tr(&mut tx, head.clone(), x0 + lw, sy, DIM, 11.0);
+    rule(&mut rs, x0 + 98.0 * sc, x0 + lw, &head, sy, sc);
     let (gx, gw, top, mid, half) = (x0 + 70.0 * sc, lw - 70.0 * sc, sy + 22.0 * sc, sy + 22.0 * sc + (sh - 40.0 * sc) * 0.62, (sh - 40.0 * sc) * 0.62);
     let max_in = s.days.iter().map(|d| d.0).max().unwrap_or(0);
     let max_out = s.days.iter().map(|d| d.1).max().unwrap_or(0);
     let down = (sh - 40.0 * sc) * 0.38;
     let bw = gw / n as f32;
+    // Ancho de barra con tope, centrada en su casilla.
+    let thick = (bw - 3.0 * sc).clamp(1.0, 14.0 * sc);
     for (i, d) in s.days.iter().enumerate() {
-        let bx = gx + i as f32 * bw;
-        if max_in > 0 && d.0 > 0 { let h = (d.0 as f32 / max_in as f32 * half).max(1.0); rs.push(((bx, mid - h, (bw - 3.0 * sc).max(1.0), h), GRAY)); }
-        if max_out > 0 && d.1 > 0 { let h = (d.1 as f32 / max_out as f32 * down).max(1.0); rs.push(((bx, mid + 1.0, (bw - 3.0 * sc).max(1.0), h), BLUE)); }
+        let bx = gx + i as f32 * bw + (bw - thick) / 2.0;
+        if max_in > 0 && d.0 > 0 { let h = (d.0 as f32 / max_in as f32 * half).max(1.0); rs.push(((bx, mid - h, thick, h), GRAY)); }
+        if max_out > 0 && d.1 > 0 { let h = (d.1 as f32 / max_out as f32 * down).max(1.0); rs.push(((bx, mid + 1.0, thick, h), BLUE)); }
     }
     rs.push(((gx, mid, gw, 1.0), LINE));
     t(&mut tx, stats::fmt_n(max_in), x0, top, LIT, 12.0, false);
@@ -186,19 +234,21 @@ pub fn build(a: R, sc: f32, st: Option<&Stats>, range: usize, mouse: (f32, f32))
     const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     if let (Some((d, h)), true) = (busiest, hmax > 0) {
         let m = format!("most active {} {h} h", DAYS[d]);
-        t(&mut tx, m.clone(), rx + rw - m.chars().count() as f32 * 6.6 * sc, sy, DIM, 11.0, false);
+        rule(&mut rs, rx + 118.0 * sc, rx + rw, &m, sy, sc);
+        tr(&mut tx, m, rx + rw, sy, DIM, 11.0);
+        
     }
     let (hx, hy) = (rx + 22.0 * sc, sy + 22.0 * sc);
-    let cell = ((rw - 22.0 * sc) / 24.0).min((sh - 60.0 * sc) / 7.0);
+    let (cell_w, cell) = ((rw - 22.0 * sc) / 24.0, (sh - 60.0 * sc) / 7.0);
     for (d, row) in s.heat.iter().enumerate() {
         t(&mut tx, ["M", "T", "W", "T", "F", "S", "S"][d].into(), rx, hy + d as f32 * cell, DIM, 11.0, false);
         for (h, v) in row.iter().enumerate() {
             let k = if hmax > 0 { (*v as f32 / hmax as f32).sqrt() } else { 0.0 };
             let g = (0x1c as f32 + k * (0xd0 - 0x1c) as f32) as u8;
-            rs.push(((hx + h as f32 * cell, hy + d as f32 * cell, cell - 2.0 * sc, cell - 2.0 * sc), [g, g, g + 2]));
+            rs.push(((hx + h as f32 * cell_w, hy + d as f32 * cell, cell_w - 2.0 * sc, cell - 2.0 * sc), [g, g, g + 2]));
         }
     }
-    for h in [0, 6, 12, 18] { t(&mut tx, h.to_string(), hx + h as f32 * cell, hy + 7.0 * cell + 4.0 * sc, DIM, 11.0, false); }
+    for h in [0, 6, 12, 18] { t(&mut tx, h.to_string(), hx + h as f32 * cell_w, hy + 7.0 * cell + 4.0 * sc, DIM, 11.0, false); }
     let lgx = rx + rw - 120.0 * sc;
     t(&mut tx, "less".into(), lgx, hy + 7.0 * cell + 22.0 * sc, DIM, 11.0, false);
     for (i, g) in [0x2a, 0x5a, 0x90, 0xd0].iter().enumerate() { rs.push(((lgx + 36.0 * sc + i as f32 * 12.0 * sc, hy + 7.0 * cell + 25.0 * sc, 10.0 * sc, 10.0 * sc), [*g, *g, *g])); }
@@ -209,8 +259,9 @@ pub fn build(a: R, sc: f32, st: Option<&Stats>, range: usize, mouse: (f32, f32))
     let mw = w * 0.48;
     let (ax, aw) = (x0 + mw + 32.0 * sc, w - mw - 32.0 * sc);
     t(&mut tx, "MODELS".into(), x0, my, DIM, 11.0, false);
-    let mm = format!("{} models", s.models.len());
-    t(&mut tx, mm.clone(), x0 + mw - mm.len() as f32 * 6.6 * sc, my, DIM, 11.0, false);
+    let mm = format!("{} model{}", s.models.len(), if s.models.len() == 1 { "" } else { "s" });
+    rule(&mut rs, x0 + 58.0 * sc, x0 + mw, &mm, my, sc);
+    tr(&mut tx, mm, x0 + mw, my, DIM, 11.0);
     let total: u64 = s.models.iter().map(|m| m.input + m.output).sum();
     let mut provs: Vec<(&str, u64)> = vec![];
     for m in &s.models {
@@ -221,68 +272,73 @@ pub fn build(a: R, sc: f32, st: Option<&Stats>, range: usize, mouse: (f32, f32))
     let mut bx = x0;
     for (p, v) in &provs {
         let bw = if total > 0 { *v as f32 / total as f32 * mw } else { 0.0 };
-        rs.push(((bx, my + 20.0 * sc, (bw - 2.0 * sc).max(1.0), 5.0 * sc), pcol(p)));
+        rs.push(((bx, my + 20.0 * sc, (bw - 2.0 * sc).max(PILL_H * sc), PILL_H * sc), pcol(p)));
         bx += bw;
     }
     let mut lx = x0;
     for (p, v) in &provs {
-        let s = format!("● {p} {:.0}%", if total > 0 { *v as f64 / total as f64 * 100.0 } else { 0.0 });
-        t(&mut tx, s.clone(), lx, my + 32.0 * sc, pcol(p), 11.0, false);
-        lx += (s.chars().count() as f32 * 6.6 + 16.0) * sc;
+        let s = format!("{p} {:.0}%", if total > 0 { *v as f64 / total as f64 * 100.0 } else { 0.0 });
+        if let Some(i) = logo_of(p) { logos.push(((lx, my + 32.0 * sc, 13.0 * sc, 13.0 * sc), i)); }
+        t(&mut tx, s.clone(), lx + 18.0 * sc, my + 32.0 * sc, DIM, 11.0, false);
+        lx += (s.chars().count() as f32 * 6.6 + 34.0) * sc;
     }
-    let (cin, cout, cl) = (x0 + mw - 170.0 * sc, x0 + mw - 100.0 * sc, x0 + mw - 36.0 * sc);
-    t(&mut tx, "input".into(), cin, my + 56.0 * sc, DIM, 11.0, false);
-    t(&mut tx, "output".into(), cout, my + 56.0 * sc, DIM, 11.0, false);
-    t(&mut tx, "tasks".into(), cl, my + 56.0 * sc, DIM, 11.0, false);
+    let (cin, cout, cl) = (x0 + mw - 130.0 * sc, x0 + mw - 60.0 * sc, x0 + mw);
+    for (s, x) in [("input", cin), ("output", cout), ("tasks", cl)] { tr(&mut tx, s.into(), x, my + 56.0 * sc, DIM, 11.0); }
     let top_in = s.models.first().map_or(0, |m| m.input + m.output);
     let rowh = 22.0 * sc;
     let shown = 6;
     for (i, m) in s.models.iter().take(shown).enumerate() {
         let y = my + 76.0 * sc + i as f32 * rowh;
         let col = pcol(stats::provider(&m.name));
-        t(&mut tx, "●".into(), x0, y, col, 11.0, false);
-        let name: String = m.name.chars().take(26).collect();
-        t(&mut tx, name, x0 + 16.0 * sc, y, LIT, 12.0, false);
-        let bmax = cin - 12.0 * sc - (x0 + 200.0 * sc);
-        if top_in > 0 && bmax > 0.0 { rs.push(((x0 + 200.0 * sc, y + 5.0 * sc, ((m.input + m.output) as f32 / top_in as f32 * bmax).max(2.0 * sc), 5.0 * sc), col)); }
-        t(&mut tx, stats::fmt_n(m.input), cin, y, LIT, 12.0, false);
-        t(&mut tx, stats::fmt_n(m.output), cout, y, LIT, 12.0, false);
-        t(&mut tx, stats::group(m.tasks), cl, y, DIM, 12.0, false);
+        if let Some(i) = logo_of(stats::provider(&m.name)) { logos.push(((x0, y + sc, 14.0 * sc, 14.0 * sc), i)); }
+        let name: String = pretty(&m.name).chars().take(26).collect();
+        t(&mut tx, name, x0 + 22.0 * sc, y, LIT, 12.0, false);
+        let bmax = cin - 56.0 * sc - (x0 + 200.0 * sc);
+        if top_in > 0 && bmax > 0.0 { rs.push(((x0 + 200.0 * sc, y + 4.0 * sc, ((m.input + m.output) as f32 / top_in as f32 * bmax).max(PILL_H * sc), PILL_H * sc), col)); }
+        tr(&mut tx, stats::fmt_n(m.input), cin, y, LIT, 12.0);
+        tr(&mut tx, stats::fmt_n(m.output), cout, y, LIT, 12.0);
+        tr(&mut tx, stats::group(m.tasks), cl, y, DIM, 12.0);
     }
     if s.models.len() > shown {
         let rest = &s.models[shown..];
         let y = my + 76.0 * sc + shown as f32 * rowh;
-        t(&mut tx, format!("{} more", rest.len()), x0 + 16.0 * sc, y, DIM, 12.0, false);
-        t(&mut tx, stats::fmt_n(rest.iter().map(|m| m.input).sum()), cin, y, DIM, 12.0, false);
-        t(&mut tx, stats::fmt_n(rest.iter().map(|m| m.output).sum()), cout, y, DIM, 12.0, false);
+        t(&mut tx, format!("{} more", rest.len()), x0 + 22.0 * sc, y, DIM, 12.0, false);
+        tr(&mut tx, stats::fmt_n(rest.iter().map(|m| m.input).sum()), cin, y, DIM, 12.0);
+        tr(&mut tx, stats::fmt_n(rest.iter().map(|m| m.output).sum()), cout, y, DIM, 12.0);
     }
 
     t(&mut tx, "AGENTS".into(), ax, my, DIM, 11.0, false);
     let note = "solo Claude Code tiene datos por ahora";
-    t(&mut tx, note.into(), ax + aw - note.chars().count() as f32 * 6.6 * sc, my, DIM, 11.0, false);
-    let (ain, aout, atime) = (ax + aw - 190.0 * sc, ax + aw - 120.0 * sc, ax + aw - 50.0 * sc);
-    t(&mut tx, "input".into(), ain, my + 56.0 * sc, DIM, 11.0, false);
-    t(&mut tx, "output".into(), aout, my + 56.0 * sc, DIM, 11.0, false);
-    t(&mut tx, "time".into(), atime, my + 56.0 * sc, DIM, 11.0, false);
-    for (i, name) in AGENTS.iter().enumerate() {
-        let y = my + 76.0 * sc + i as f32 * rowh;
-        t(&mut tx, (*name).into(), ax, y, if i == 0 { LIT } else { DIM }, 12.0, false);
+    tr(&mut tx, note.into(), ax + aw, my, DIM, 11.0);
+    rule(&mut rs, ax + 58.0 * sc, ax + aw, note, my, sc);
+    let (ain, aout, atime) = (ax + aw - 140.0 * sc, ax + aw - 70.0 * sc, ax + aw);
+    for (s, x) in [("input", ain), ("output", aout), ("time", atime)] { tr(&mut tx, s.into(), x, my + 56.0 * sc, DIM, 11.0); }
+    for (row, i) in [0, 2, 1, 4, 5, 3].into_iter().enumerate() {
+        let (name, y) = (AGENTS[i], my + 76.0 * sc + row as f32 * rowh);
+        logos.push(((ax, y + sc, 14.0 * sc, 14.0 * sc), i));
+        t(&mut tx, name.into(), ax + 22.0 * sc, y, if i == 0 { LIT } else { DIM }, 12.0, false);
         if i == 0 {
-            rs.push(((ax + 130.0 * sc, y + 5.0 * sc, (ain - 16.0 * sc - (ax + 130.0 * sc)).max(2.0), 5.0 * sc), [0x9a, 0x9a, 0xa2]));
-            t(&mut tx, stats::fmt_n(c.input), ain, y, LIT, 12.0, false);
-            t(&mut tx, stats::fmt_n(c.output), aout, y, LIT, 12.0, false);
-            t(&mut tx, stats::fmt_dur(c.secs), atime, y, LIT, 12.0, false);
+            rs.push(((ax + 150.0 * sc, y + 4.0 * sc, (ain - 60.0 * sc - (ax + 150.0 * sc)).max(PILL_H * sc), PILL_H * sc), [0x9a, 0x9a, 0xa2]));
+            tr(&mut tx, stats::fmt_n(c.input), ain, y, LIT, 12.0);
+            tr(&mut tx, stats::fmt_n(c.output), aout, y, LIT, 12.0);
+            tr(&mut tx, stats::fmt_dur(c.secs), atime, y, LIT, 12.0);
         } else {
-            for x in [ain, aout, atime] { t(&mut tx, "—".into(), x, y, DIM, 12.0, false); }
+            for x in [ain, aout, atime] { tr(&mut tx, "—".into(), x, y, DIM, 12.0); }
         }
     }
     let _ = today;
-    (rs, tx)
+    (rs, tx, logos)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nombres_de_modelo() {
+        assert_eq!(pretty("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(pretty("claude-haiku-4-5-20251001"), "Haiku 4.5");
+        assert_eq!(pretty("gpt-6.1-sol"), "gpt-6.1-sol");
+    }
     #[test]
     fn zonas_de_rango_y_cerrar() {
         let a = (500.0, 72.0, 2000.0, 1200.0);
@@ -298,10 +354,10 @@ mod tests {
     }
     #[test]
     fn construye_sin_datos_y_con_datos() {
-        let (rs, tx) = build((0.0, 0.0, 1600.0, 900.0), 1.0, None, 1, (0.0, 0.0));
+        let (rs, tx, _) = build((0.0, 0.0, 1600.0, 900.0), 1.0, None, 1, (0.0, 0.0));
         assert!(!rs.is_empty() && tx.iter().any(|t| t.0.starts_with("Leyendo")));
         let st = stats::compute(&[], Some(30), chrono::Local::now().date_naive());
-        let (_, tx) = build((0.0, 0.0, 1600.0, 900.0), 1.0, Some(&st), 1, (0.0, 0.0));
+        let (_, tx, _) = build((0.0, 0.0, 1600.0, 900.0), 1.0, Some(&st), 1, (0.0, 0.0));
         assert!(tx.iter().any(|t| t.0 == "INPUT TOKENS") && tx.iter().any(|t| t.0 == "—"));
     }
 }

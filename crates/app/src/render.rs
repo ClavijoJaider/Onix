@@ -2,6 +2,7 @@
 use crate::sidebar as sb;
 use cosmic_text::{Buffer, CacheKey, Color, FontSystem, SwashCache, SwashContent};
 use std::collections::HashMap;
+use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 use term_core::Rgb;
 
@@ -69,13 +70,17 @@ impl Frame {
     /// Huella de cada franja de una pantalla de alto `h`, y qué operaciones la tocan.
     pub fn bands(&self, h: usize) -> (Vec<u64>, Vec<Vec<u32>>) {
         let n = (h as i32 + BAND - 1) / BAND;
-        let mut hs: Vec<_> = (0..n).map(|_| std::collections::hash_map::DefaultHasher::new()).collect();
+        let mut hs = vec![FxHasher::default(); n as usize];
         let mut idx = vec![vec![]; n as usize];
         for (i, op) in self.ops.iter().enumerate() {
             let (y0, y1) = (op.r[1].max(op.clip[1]).max(0), (op.r[1] + op.r[3]).min(op.clip[3]).min(h as i32));
             if y0 >= y1 { continue; }
+            // Una huella por operación, rápida: se calcula en cada cuadro para miles de ellas.
+            let mut one = FxHasher::default();
+            op.hash(&mut one);
+            let one = one.finish();
             for b in y0 / BAND..=(y1 - 1) / BAND {
-                op.hash(&mut hs[b as usize]);
+                hs[b as usize].write_u64(one);
                 idx[b as usize].push(i as u32);
             }
         }

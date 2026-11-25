@@ -5,6 +5,6 @@ Cada carpeta con un `linea.py` es un plugin; `statusline.py` los une en orden al
 
 Activar, en `~/.claude/settings.json`:
 
-    "statusLine": { "type": "command", "command": "python3 ~/Desktop/mi-terminal/plugins/statusline.py" }
+    "statusLine": { "type": "command", "command": "python3 ~/Desktop/onix/mac/codigo/plugins/statusline.py" }
 
 Volver a lo de antes: `python3 ~/.claude/statusline.py`.

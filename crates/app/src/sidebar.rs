@@ -88,6 +88,11 @@ pub const ICON_PULSE: u16 = 14;
 pub const ICON_GLOBE: u16 = 15;
 pub const ICON_FOLDER: u16 = 16;
 pub const ICON_ROBOT: u16 = 17;
+/// Disco relleno (insignia de estado).
+pub const ICON_DOT: u16 = 18;
+/// Cometa en órbita (trabajando): ids `ICON_SPIN..ICON_SPIN + SPIN_FRAMES`, una vuelta por segundo.
+pub const ICON_SPIN: u16 = 20;
+pub const SPIN_FRAMES: u16 = 24;
 
 /// Trazos del ícono en una cuadrícula de 24: (segmentos [x0, y0, x1, y1], elipses [cx, cy, rx, ry]).
 fn icon_shapes(id: u16) -> Option<(Vec<[f32; 4]>, Vec<[f32; 4]>)> {
@@ -101,15 +106,34 @@ fn icon_shapes(id: u16) -> Option<(Vec<[f32; 4]>, Vec<[f32; 4]>)> {
         ICON_PULSE => (open(&[(2.0, 12.0), (7.0, 12.0), (10.0, 5.0), (14.0, 19.0), (17.0, 12.0), (22.0, 12.0)]), vec![]),
         ICON_GLOBE => (vec![[3.0, 12.0, 21.0, 12.0]], vec![[12.0, 12.0, 9.0, 9.0], [12.0, 12.0, 4.0, 9.0]]),
         ICON_FOLDER => (poly(&[(3.0, 6.0), (9.0, 6.0), (11.5, 8.5), (21.0, 8.5), (21.0, 19.0), (3.0, 19.0)]), vec![]),
-        ICON_ROBOT => ([poly(&[(5.0, 8.0), (19.0, 8.0), (19.0, 19.0), (5.0, 19.0)]), vec![[12.0, 8.0, 12.0, 4.0], [2.5, 12.0, 2.5, 15.0], [21.5, 12.0, 21.5, 15.0], [9.0, 16.0, 15.0, 16.0]]].concat(), vec![[9.0, 12.0, 1.2, 1.2], [15.0, 12.0, 1.2, 1.2]]),
+        ICON_ROBOT => ([poly(&[(5.0, 8.0), (19.0, 8.0), (19.0, 19.0), (5.0, 19.0)]), vec![[12.0, 8.0, 12.0, 4.0], [2.5, 12.0, 2.5, 15.0], [21.5, 12.0, 21.5, 15.0], [9.0, 16.0, 15.0, 16.0]]].concat(), vec![[9.0, 12.0, 1.0, 1.0], [15.0, 12.0, 1.0, 1.0]]),
         _ => return None,
     })
 }
 
-/// Máscara alfa `n`x`n` del ícono de cromo `id`: trazo fino (1.5 de 24) con extremos redondos.
+/// Máscara alfa `n`x`n` del ícono de cromo `id`: trazo de 2 sobre 24 con extremos redondos.
 fn chrome_icon(id: u16, n: usize) -> Option<Vec<u8>> {
+    if (ICON_SPIN..ICON_SPIN + SPIN_FRAMES).contains(&id) {
+        use std::f32::consts::TAU;
+        let head = (id - ICON_SPIN) as f32 / SPIN_FRAMES as f32 * TAU;
+        return Some((0..n * n).map(|p| {
+            // Cometa: cinco puntos en órbita (caja de 10), cada vez más chicos y tenues.
+            let (x, y) = (((p % n) as f32 + 0.5) * 10.0 / n as f32, ((p / n) as f32 + 0.5) * 10.0 / n as f32);
+            let a = (0..5).map(|k| {
+                let k = k as f32;
+                let (s, c) = (head - k * 0.55).sin_cos();
+                let d = (x - 5.0 - 3.7 * c).hypot(y - 5.0 - 3.7 * s);
+                ((1.4 - 0.2 * k - d) * n as f32 / 10.0 + 0.5).clamp(0.0, 1.0) * (1.0 - 0.18 * k)
+            }).fold(0.0, f32::max);
+            (a * 255.0).round() as u8
+        }).collect());
+    }
+    if id == ICON_DOT {
+        let r = n as f32 / 2.0;
+        return Some((0..n * n).map(|p| { let d = ((p % n) as f32 + 0.5 - r).hypot((p / n) as f32 + 0.5 - r); ((r - d + 0.5).clamp(0.0, 1.0) * 255.0) as u8 }).collect());
+    }
     let (segs, rings) = icon_shapes(id)?;
-    let (k, hw) = (24.0 / n as f32, 0.75);
+    let (k, hw) = (24.0 / n as f32, 1.0);
     let mut out = Vec::with_capacity(n * n);
     for j in 0..n { for i in 0..n {
         let (px, py) = ((i as f32 + 0.5) * k, (j as f32 + 0.5) * k);
@@ -154,7 +178,7 @@ pub fn agent_from(name: &str, path: &str) -> Agent {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Status { Working, Waiting, Done }
+pub enum Status { Asking, Working, Waiting, Done }
 
 /// Título con spinner al inicio = el agente está trabajando. Claude Code alterna ◐/◑ mientras piensa
 /// y pone ✳ en reposo (visto en su binario 2.1.331); otros CLIs usan braille.
@@ -168,6 +192,31 @@ pub fn status(agent: Agent, had_agent: bool, since_out: Duration, title: &str) -
     if busy { Status::Working } else { Status::Waiting }
 }
 
+/// El pie del agente ofrece interrumpir: está trabajando, aunque algo haya pisado el spinner del título.
+/// Solo las últimas líneas, para no confundirlo con esa frase dentro de la conversación.
+pub fn interruptible(rows: &[String]) -> bool {
+    rows.iter().rev().filter(|r| !r.trim().is_empty()).take(5).any(|r| r.contains("esc to interrupt"))
+}
+
+/// El agente espera que respondas: un menú numerado con el cursor en una opción, como el permiso de Claude o Codex.
+/// Solo mira lo que está en pantalla; no guarda nada.
+// shortcut: reconoce esos menús y "(y/n)"; si un agente pregunta de otra forma, añadir aquí su señal.
+pub fn asking(rows: &[String]) -> bool {
+    let clean: Vec<&str> = rows.iter().map(|r| r.trim_matches(|c: char| c.is_whitespace() || ('\u{2500}'..='\u{257f}').contains(&c))).collect();
+    let option = |r: &str| r.strip_prefix("❯ ").or_else(|| r.strip_prefix("› ")).is_some_and(|o| o.starts_with(|c: char| c.is_ascii_digit()) && o.get(1..3) == Some(". "));
+    let menu = clean.iter().any(|r| option(r))
+        && clean.iter().any(|r| r.contains("1. Yes") || r.contains("Esc to cancel") || r.contains("Enter to select") || r.contains("Press enter to confirm"));
+    menu || clean.iter().rev().find(|r| !r.is_empty()).is_some_and(|r| r.ends_with("(y/n)") || r.ends_with("[y/N]") || r.ends_with("[Y/n]"))
+}
+
+/// Siguiente panel que te necesita después de `at`, dando la vuelta: primero los que preguntan, luego los que terminaron.
+/// Cada elemento es (pregunta, terminó sin que lo vieras).
+pub fn next_attention(flags: &[(bool, bool)], at: usize) -> Option<usize> {
+    let n = flags.len();
+    let after = |f: fn(&(bool, bool)) -> bool| (1..=n).map(|d| (at + d) % n).find(|&i| f(&flags[i]));
+    after(|f| f.0).or_else(|| after(|f| f.1))
+}
+
 /// Ruta del cwd con la home abreviada como `~` (vacío = `~`).
 pub fn tilde(cwd: &str, home: &str) -> String {
     let cwd = cwd.trim_end_matches('/');
@@ -176,7 +225,7 @@ pub fn tilde(cwd: &str, home: &str) -> String {
 }
 
 impl Status {
-    pub fn label(self) -> &'static str { match self { Status::Working => "Working", Status::Waiting => "Waiting", Status::Done => "Done" } }
+    pub fn label(self) -> &'static str { match self { Status::Working => "Working", Status::Waiting => "Waiting", Status::Asking => "Needs you", Status::Done => "Done" } }
 }
 
 /// 27s, 3m, 2h, 1d.
@@ -202,20 +251,20 @@ pub enum Filter { All, Waiting, Working }
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub tab: usize, pub pane: usize, pub project: String, pub title: String, pub agent: Agent,
-    pub status: Status, pub secs: u64, pub unread: bool, pub focused: bool,
+    pub status: Status, pub done: bool, pub secs: u64, pub unread: bool, pub focused: bool,
 }
 
 /// (All, Waiting, Working)
 pub fn counts(es: &[Entry]) -> (usize, usize, usize) {
     let n = |s| es.iter().filter(|e| e.status == s).count();
-    (es.len(), n(Status::Waiting), n(Status::Working))
+    (es.len(), n(Status::Waiting) + n(Status::Asking), n(Status::Working))
 }
 
 /// Filtra por estado y por texto (título o proyecto, sin distinguir mayúsculas).
 pub fn filter(es: Vec<Entry>, f: Filter, q: &str) -> Vec<Entry> {
     let q = q.to_lowercase();
     es.into_iter().filter(|e| {
-        let ok = match f { Filter::All => true, Filter::Waiting => e.status == Status::Waiting, Filter::Working => e.status == Status::Working };
+        let ok = match f { Filter::All => true, Filter::Waiting => matches!(e.status, Status::Waiting | Status::Asking), Filter::Working => e.status == Status::Working };
         ok && (q.is_empty() || e.title.to_lowercase().contains(&q) || e.project.to_lowercase().contains(&q))
     }).collect()
 }
@@ -338,10 +387,10 @@ pub fn archived_from_json(t: &str) -> Vec<Archived> {
     }).collect()
 }
 
-/// Panel "Agents": filas = agentes abiertos (no Shell), working primero y luego los más recientes.
+/// Panel "Agents": filas = agentes abiertos (no Shell), los que piden respuesta, luego working y luego los más recientes.
 pub fn agent_rows(es: Vec<Entry>) -> Vec<Entry> {
     let mut v: Vec<Entry> = es.into_iter().filter(|e| e.agent != Agent::Shell).collect();
-    v.sort_by_key(|e| (e.status != Status::Working, e.secs));
+    v.sort_by_key(|e| (match e.status { Status::Asking => 0, Status::Working => 1, _ => 2 }, e.secs));
     v
 }
 /// Selección tras mover `d` filas, con tope en 0..n-1. shortcut: se indexa por posición; si la lista se reordena, la selección sigue la posición.
@@ -356,14 +405,17 @@ pub enum AHit { Close, Row(usize) }
 pub const RIGHT_W: f32 = 330.0;
 /// Rects (px) de los paneles de la columna derecha bajo la barra de pestañas (`top` px):
 /// Agents arriba y Processes abajo si están los dos; uno solo ocupa toda la columna.
-pub fn column(win: (f32, f32), sc: f32, top: f32, agents: bool, procs: bool) -> (Option<R>, Option<R>) {
+pub fn column(win: (f32, f32), sc: f32, top: f32, open: [bool; 3]) -> [Option<R>; 3] {
     let (x, w, h) = (win.0 - RIGHT_W * sc, RIGHT_W * sc, (win.1 - top).max(1.0));
-    match (agents, procs) {
-        (true, true) => { let ha = (h * 0.45).round(); (Some((x, top, w, ha)), Some((x, top + ha, w, h - ha))) }
-        (true, false) => (Some((x, top, w, h)), None),
-        (false, true) => (None, Some((x, top, w, h))),
-        _ => (None, None),
-    }
+    // Alto repartido entre los abiertos: Agents (filas simples) pide algo menos que Processes y Ports.
+    let weight = |k: usize| if !open[k] { 0.0 } else if k == 0 { 0.45 } else { 0.55 };
+    let total: f32 = (0..3).map(weight).sum();
+    let mut acc = 0.0;
+    std::array::from_fn(|k| open[k].then(|| {
+        let y = top + (h * acc / total).round();
+        acc += weight(k);
+        (x, y, w, top + (h * acc / total).round() - y)
+    }))
 }
 /// Panel de la columna en `r` (px): cerrar arriba a la derecha y filas desde `rows_top` (px lógicos), dejando `foot` abajo.
 fn panel_layout(r: R, sc: f32, n: usize, rows_top: f32, foot: f32) -> Vec<(R, AHit)> {
@@ -383,12 +435,23 @@ pub fn ahit_at(l: &[(R, AHit)], m: (f32, f32)) -> Option<AHit> {
     l.iter().find(|(r, _)| m.0 >= r.0 && m.0 < r.0 + r.2 && m.1 >= r.1 && m.1 < r.1 + r.3).map(|(_, h)| *h)
 }
 
+#[derive(Default)]
+pub struct List { pub open: bool, pub sel: usize, pub query: String, pub stop: Option<(i32, String, i32, u32)>, pub nope: bool, pub changed: bool }
+
+impl Side {
+    pub fn open_panels(&self) -> [bool; 3] { [self.agents_open, self.lists[0].open, self.lists[1].open] }
+}
+
 pub struct Side {
     /// La columna derecha (Agents/Processes) recibe el teclado: al abrirla o al hacer clic en ella.
     pub col_focus: bool,
     pub agents_open: bool, pub agents_sel: usize, pub stop_at: Option<std::time::Instant>,
     pub visible: bool, pub focus: bool, pub searching: bool, pub query: String, pub filter: Filter,
-    pub procs_open: bool, pub psel: usize, pub psort: crate::procs::Sort, pub pquery: String, pub pstop: Option<(i32, String, i32, u32)>, pub pnope: bool, pub pchanged: bool, pub mon: crate::procs::Mon,
+    /// Processes (0) y Ports (1): cada uno con su búsqueda, selección y confirmación.
+    pub lists: [List; 2],
+    /// Panel de la columna que recibe el teclado: 0 Agents, 1 Processes, 2 Ports.
+    pub kf: usize,
+    pub psort: crate::procs::Sort, pub mon: crate::procs::Mon,
     pub archived: Vec<Archived>, pub open_archived: bool, pub installed: [bool; 6],
 }
 
@@ -396,7 +459,7 @@ pub struct Side {
 mod tests {
     use super::*;
     fn e(project: &str, title: &str, status: Status) -> Entry {
-        Entry { tab: 0, pane: 0, project: project.into(), title: title.into(), agent: Agent::Claude, status, secs: 0, unread: false, focused: false }
+        Entry { tab: 0, pane: 0, project: project.into(), title: title.into(), agent: Agent::Claude, status, done: false, secs: 0, unread: false, focused: false }
     }
     #[test]
     fn agente_desde_argv_de_node() {
@@ -512,7 +575,7 @@ mod tests {
         assert_eq!(r.iter().map(|x| x.project.as_str()).collect::<Vec<_>>(), ["c", "b", "a"]);
         assert_eq!(counts(&r).2, 2);
         assert_eq!([move_sel(0, -1, 3), move_sel(1, 1, 3), move_sel(2, 1, 3), move_sel(0, 1, 0)], [0, 2, 2, 0]);
-        let (ra, rp) = column((2000.0, 1200.0), 2.0, 72.0, true, false);
+        let [ra, rp, _] = column((2000.0, 1200.0), 2.0, 72.0, [true, false, false]);
         let ra = ra.unwrap();
         assert!(rp.is_none() && ra.0 == 2000.0 - RIGHT_W * 2.0 && ra.1 == 72.0 && ra.3 == 1128.0);
         let l = agents_layout(ra, 2.0, 2);
@@ -520,9 +583,32 @@ mod tests {
         assert_eq!(ahit_at(&l, (ra.0 + 20.0, 72.0 + (40.0 + ROW_H) * 2.0 + 4.0)), Some(AHit::Row(1)));
         assert_eq!(ahit_at(&l, (ra.0 + 20.0, 72.0 + (40.0 + 2.0 * ROW_H) * 2.0 + 4.0)), None);
         assert_eq!(ahit_at(&l, (20.0, 72.0 + 44.0 * 2.0)), None);
-        let (a2, p2) = column((2000.0, 1200.0), 2.0, 72.0, true, true);
+        let three = column((2000.0, 1200.0), 2.0, 72.0, [true; 3]).map(Option::unwrap);
+        assert!(three[0].1 + three[0].3 == three[1].1 && three[1].1 + three[1].3 == three[2].1 && three[2].1 + three[2].3 == 1200.0);
+        let [a2, p2, _] = column((2000.0, 1200.0), 2.0, 72.0, [true, true, false]);
         let (a2, p2) = (a2.unwrap(), p2.unwrap());
         assert!(a2.1 + a2.3 == p2.1 && p2.1 + p2.3 == 1200.0);
+    }
+    #[test]
+    fn trabajando_por_el_pie() {
+        let r = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(interruptible(&r(&["✻ Pensando…", "❯ ", "───", "  ⏵⏵ auto mode on · esc to interrupt", ""])));
+        assert!(!interruptible(&r(&["dice esc to interrupt", "a", "b", "c", "❯ ", "  ⏵⏵ auto mode on"])));
+    }
+    #[test]
+    fn semaforo() {
+        let r = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(asking(&r(&["│ Do you want to proceed?  │", "│ ❯ 1. Yes                 │", "│   2. No                  │"])));
+        assert!(asking(&r(&["  1. Rojo", "❯ 2. Verde", "", "Enter to select · Esc to cancel"])));
+        assert!(asking(&r(&["› 1. Yes, proceed", "  2. No"])));
+        assert!(asking(&r(&["Overwrite file? (y/n)", ""])));
+        // Una lista escrita en el cuadro de entrada no es una pregunta.
+        assert!(!asking(&r(&["❯ 1. arregla esto", "  2. y esto", "⏵⏵ auto mode on"])));
+        assert!(!asking(&r(&["❯ ", "hola"])));
+        let f = [(false, true), (false, false), (true, false), (false, false)];
+        assert_eq!(next_attention(&f, 0), Some(2));
+        assert_eq!(next_attention(&f[..2], 1), Some(0));
+        assert_eq!(next_attention(&[(false, false)], 0), None);
     }
     #[test]
     fn layout_y_clic() {

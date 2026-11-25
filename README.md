@@ -41,7 +41,8 @@ En Claude Code, las marcas `[Image #1]` de las imágenes que pegas se pintan de 
 
 Ónix ajusta cómo se ve Claude Code sin cambiar lo que el programa envía ni lo que copias:
 
-- Muestra el consumo de contexto como una barra fina sobre el cuadro de escritura. Cambia de color al llegar al 60 % y al 80 %.
+- Muestra el consumo de contexto como una barra fina en el pie, junto al uso, y en cada sesión de la barra lateral. Cambia de color al llegar al 60 % y al 80 %.
+- Separa tus mensajes con un bloque y encierra el cuadro de escritura en un marco redondeado.
 - Junta la línea de uso con la línea del modo (por ejemplo "auto mode on") cuando caben en la misma fila.
 - Oculta la ayuda "(shift+tab to cycle)" y el nombre de sesión repetido sobre el cuadro de escritura.
 - Mantiene el cuadro de escritura abajo cuando se cierra un diálogo.
@@ -72,6 +73,20 @@ La lista de agentes (⇧⌘A) muestra los que están abiertos. Con las flechas e
 
 La lista de procesos (⇧⌘P) muestra CPU, memoria y puertos en escucha. Puedes escribir para filtrar, ordenar con Tab y saltar al panel de un proceso con Enter. Para detener uno de tus procesos, pulsa ⌘⌫ y confirma con Enter.
 
+El botón del mundo (⇧⌘L) lista los puertos que tus programas tienen en escucha, con el proceso de cada uno. Con Enter o un clic se abre en el navegador, ⌘C copia la dirección y Tab salta a su terminal. Para detenerlo, pulsa ⌘⌫ y Enter, o haz dos clics en la ×.
+
+Las listas de agentes, procesos y puertos se pueden abrir a la vez, una debajo de otra. El teclado va a la última que abriste o tocaste.
+
+### Semáforo de agentes
+
+La barra lateral y la lista de agentes dicen cómo va cada uno con un punto que late: ámbar si espera tu respuesta o un permiso, azul mientras trabaja y verde si terminó y aún no lo has visto. Con ⌘J saltas al que te necesita. Si no lo estás mirando, Ónix te avisa con una notificación.
+
+Con Claude Code, Ónix lee el estado que él mismo anota en `~/.claude/sessions`. Con los demás reconoce en pantalla los menús numerados y las preguntas de sí o no. No guarda ese texto.
+
+## Paleta de comandos
+
+Con ⌘K escribes lo que quieres hacer: ir a una pestaña, abrir un panel, lanzar un agente o retomar una sesión archivada. Eliges con las flechas y Enter, o con un clic. Esc la cierra.
+
 El panel "Agent usage" (⇧⌘U) muestra tokens por día y por modelo, tareas, tiempo y un mapa de las horas de más actividad, para 7, 30 o 90 días o todo el historial. Por ahora solo cuenta el uso de Claude Code.
 
 ## Plugins de la línea de estado
@@ -95,6 +110,8 @@ Para crear otro plugin, añade una carpeta en `plugins` con un archivo `linea.py
 
 | Atajo | Acción |
 |---|---|
+| ⌘K | Paleta de comandos |
+| ⌘J | Ir al agente que te necesita |
 | ⌘T | Pestaña nueva |
 | ⇧⌘O | Elegir una carpeta |
 | ⌘W | Cerrar el panel actual |
@@ -105,8 +122,13 @@ Para crear otro plugin, añade una carpeta en `plugins` con un archivo `linea.py
 | ⌘B | Mostrar u ocultar la barra lateral |
 | ⇧⌘A | Lista de agentes |
 | ⇧⌘P | Lista de procesos |
+| ⇧⌘L | Puertos abiertos |
+| ⌘F | Buscar en el historial (⏎ anterior, ⇧⏎ siguiente) |
+| ⌘+ ⌘− ⌘0 | Agrandar, achicar o restablecer la letra |
 | ⇧⌘U | Panel "Agent usage" (se cierra con Esc) |
 | ⌘C y ⌘V | Copiar y pegar |
+| ⌘A | Seleccionar solo lo que estás escribiendo, para copiarlo con ⌘C |
+| ⌘Z | Deshacer lo recién pegado o escrito (zsh y Claude Code) |
 | ⇧RePág y ⇧AvPág | Recorrer el historial |
 
 ## Tus datos

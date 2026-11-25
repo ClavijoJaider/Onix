@@ -38,6 +38,33 @@ pub fn parse_lsof(out: &str) -> HashMap<i32, u16> {
     m
 }
 
+/// Todos los puertos en escucha de la misma salida: (puerto, pid), sin repetir IPv4/IPv6 y ordenados.
+pub fn parse_listen(out: &str) -> Vec<(u16, i32)> {
+    let mut v: Vec<(u16, i32)> = out.lines().skip(1).filter_map(|l| {
+        let t: Vec<&str> = l.split_whitespace().collect();
+        let i = t.iter().position(|x| *x == "(LISTEN)")?;
+        Some((t.get(i.checked_sub(1)?)?.rsplit(':').next()?.parse().ok()?, t.get(1)?.parse().ok()?))
+    }).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Filas del panel Ports: una por puerto, filtradas por número, proceso o pid.
+pub fn port_rows(ps: &[Proc], listen: &[(u16, i32)], q: &str) -> Vec<Row> {
+    let all = rows_of(ps);
+    let q = q.to_lowercase();
+    listen.iter().filter_map(|&(port, pid)| all.get(&pid).map(|r| Row { port: Some(port), ..r.clone() }))
+        .filter(|r| q.is_empty() || r.name.to_lowercase().contains(&q) || r.pid.to_string() == q || r.port.is_some_and(|p| p.to_string().starts_with(&q)))
+        .take(MAX_ROWS).collect()
+}
+
+fn rows_of(ps: &[Proc]) -> HashMap<i32, Row> {
+    let names: HashMap<i32, &str> = ps.iter().map(|p| (p.pid, p.name.as_str())).collect();
+    ps.iter().map(|p| (p.pid, Row { pid: p.pid, ppid: p.ppid, uid: p.uid, name: p.name.clone(), cpu: p.cpu, rss_kb: p.rss_kb, port: None,
+        parent: names.get(&p.ppid).filter(|n| p.ppid > 1 && **n != p.name).map(|n| n.to_string()) })).collect()
+}
+
 /// Bytes usados según `vm_stat` (active + wired + compressor); el tamaño de página sale de la primera línea.
 pub fn parse_vm_stat(out: &str) -> Option<u64> {
     let page: u64 = out.lines().next()?.split("page size of ").nth(1)?.split_whitespace().next()?.parse().ok()?;
@@ -101,7 +128,7 @@ pub fn same_proc(ps: &[Proc], pid: i32, name: &str, ppid: i32, uid: u32) -> bool
 pub fn fmt_mem(kb: u64) -> String { if kb >= 1 << 20 { format!("{:.1} GB", kb as f64 / (1u64 << 20) as f64) } else { format!("{} MB", kb / 1024) } }
 
 #[derive(Default, Clone)]
-pub struct Snap { pub procs: Vec<Proc>, pub ports: HashMap<i32, u16>, pub cpu: f32, pub used: u64, pub total: u64 }
+pub struct Snap { pub procs: Vec<Proc>, pub ports: HashMap<i32, u16>, pub listen: Vec<(u16, i32)>, pub cpu: f32, pub used: u64, pub total: u64 }
 
 /// Hilo único de muestreo; solo trabaja mientras `on` esté activa.
 #[derive(Clone)]
@@ -157,10 +184,11 @@ impl Mon {
                         (s.cpu, s.used, s.total, s.procs) = (sys_cpu(&p, ncpu), used, total, p);
                     }
                 }
-                if last_lsof.is_none_or(|t| t.elapsed() >= Duration::from_secs(15)) {
+                if last_lsof.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
                     last_lsof = Some(Instant::now());
-                    let ports = run("lsof", &["-iTCP", "-sTCP:LISTEN", "-nP"], 4).map(|s| parse_lsof(&s)).unwrap_or_default();
-                    snap.lock().unwrap().ports = ports;
+                    let out = run("lsof", &["-iTCP", "-sTCP:LISTEN", "-nP"], 4).unwrap_or_default();
+                    let mut s = snap.lock().unwrap();
+                    (s.ports, s.listen) = (parse_lsof(&out), parse_listen(&out));
                 }
             }
         });
@@ -184,6 +212,16 @@ mod tests {
         let l = parse_lsof(LSOF);
         assert_eq!((l[&200], l[&612], l.len()), (9222, 49152, 2));
         assert!(parse_lsof("").is_empty());
+    }
+    #[test]
+    fn panel_de_puertos() {
+        let l = parse_listen(LSOF);
+        assert_eq!(l, [(3000, 200), (9222, 200), (49152, 612)]);
+        let r = port_rows(&ps(), &l, "");
+        // 612 no está en la lista de procesos: no se muestra.
+        assert_eq!(r.iter().map(|r| (r.port.unwrap(), r.name.as_str())).collect::<Vec<_>>(), [(3000, "node"), (9222, "node")]);
+        assert_eq!(port_rows(&ps(), &l, "92").len(), 1);
+        assert!(port_rows(&ps(), &l, "chrome").is_empty());
     }
     #[test]
     fn vm_stat_y_cpu() {

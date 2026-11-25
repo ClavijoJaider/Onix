@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 pub use alacritty_terminal;
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
+use std::sync::atomic::{AtomicU64, Ordering};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
@@ -153,6 +154,8 @@ pub struct Session {
     writer: Writer,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Sube con cada lectura del PTY (con `term` tomado): si no cambió, la rejilla tampoco por parte del programa.
+    pub version: Arc<AtomicU64>,
     /// PID del hijo (zsh o el CLI lanzado).
     pub child_pid: Option<u32>,
 }
@@ -206,19 +209,24 @@ impl Session {
         let title = Arc::new(Mutex::new(String::new()));
         let config = Config { scrolling_history: SCROLLBACK, ..Config::default() };
         let term = Arc::new(Mutex::new(Term::new(config, &Size(80, 24), Listener(writer.clone(), title.clone()))));
-        let t = term.clone();
+        let version = Arc::new(AtomicU64::new(0));
+        let (t, v) = (term.clone(), version.clone());
         std::thread::spawn(move || {
             let mut parser: Processor = Processor::new();
             let mut buf = [0u8; 16384];
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 { break; }
-                parser.advance(&mut *t.lock().unwrap(), &buf[..n]);
+                {
+                    let mut term = t.lock().unwrap();
+                    parser.advance(&mut *term, &buf[..n]);
+                    v.fetch_add(1, Ordering::Relaxed);
+                }
                 on_output();
             }
             on_exit();
         });
         std::thread::spawn(move || { let _ = child.wait(); });
-        Self { term, title, writer, master: pair.master, killer, child_pid }
+        Self { term, title, version, writer, master: pair.master, killer, child_pid }
     }
 
     /// PID del proceso en primer plano del PTY (el líder de su grupo), si se conoce.

@@ -1,6 +1,8 @@
 //! Ónix: ventana winit + IOSurface con texto en CPU (cosmic-text) sobre term-core.
 mod glyphs;
+mod activity;
 mod marquee;
+mod palette;
 mod procs;
 mod render;
 mod sidebar;
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use term_core::alacritty_terminal::grid::{Dimensions, Scroll};
 use term_core::alacritty_terminal::index::{Column, Line, Point, Side};
-use term_core::alacritty_terminal::selection::{Selection, SelectionType};
+use term_core::alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use term_core::alacritty_terminal::term::cell::Flags;
 use term_core::alacritty_terminal::term::{Term, TermMode};
 use term_core::alacritty_terminal::event::EventListener;
@@ -31,6 +33,7 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Window, WindowId};
 
 const FONT_SIZE: f32 = 13.0;
+const FONT_RANGE: (f32, f32) = (9.0, 28.0);
 const PAD: f32 = 8.0;
 /// Aire extra bajo la última fila, en px lógicos: sin él la línea de estado queda pegada al borde.
 const BOTTOM_SPACE: f32 = 10.0;
@@ -39,6 +42,13 @@ const TABBAR_H: f32 = 36.0;
 const TABBAR_BG: Rgb = [0x08, 0x08, 0x0a];
 const TAB_ACTIVE: Rgb = [0x16, 0x16, 0x1a];
 const TAB_HOVER: Rgb = [0x10, 0x10, 0x13];
+/// Fondo con el que Claude Code pinta tus mensajes, y cómo se ven aquí.
+const USER_BG_IN: Rgb = [0x37, 0x37, 0x37];
+const USER_BG: Rgb = [0x17, 0x19, 0x1f];
+const USER_BAR: Rgb = [0x5a, 0x8d, 0xee];
+const INPUT_BG: Rgb = [0x0f, 0x0f, 0x12];
+/// Radio (px lógicos) de botones, filas y pestañas.
+const RADIUS: f32 = 7.0;
 const SEP_W: f32 = 1.0;
 const SEP_COLOR: Rgb = [0x26, 0x26, 0x2c];
 const FOCUS_LINE: Rgb = [0x4a, 0x4a, 0x56];
@@ -164,6 +174,18 @@ fn resume_cmd(token: &str, last: bool) -> Option<Vec<String>> {
 }
 
 /// sessionId de Claude Code del proceso `pid` según `~/.claude/sessions/<pid>.json` (solo lectura); exige que el pid coincida.
+/// Lo que Claude Code dice de sí mismo en su archivo de sesión: (pregunta, trabaja). `None` si no lo dice.
+fn claude_state(json: &str) -> Option<(bool, bool)> {
+    match serde_json::from_str::<serde_json::Value>(json).ok()?.get("status")?.as_str()? {
+        "waiting" => Some((true, false)), "busy" => Some((false, true)), "idle" => Some((false, false)), _ => None,
+    }
+}
+
+fn claude_status(pid: i32) -> Option<(bool, bool)> {
+    let f = std::path::Path::new(&std::env::var_os("HOME")?).join(format!(".claude/sessions/{pid}.json"));
+    claude_state(&std::fs::read_to_string(f).ok()?)
+}
+
 fn claude_session(pid: i32) -> Option<String> {
     let f = std::path::Path::new(&std::env::var_os("HOME")?).join(format!(".claude/sessions/{pid}.json"));
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f).ok()?).ok()?;
@@ -287,14 +309,36 @@ struct Gfx {
     /// El compositor aún usaba la superficie libre: hay que repetir el frame.
     busy: bool, chip: Buffer, icons: Vec<Buffer>, side: Vec<(String, Buffer)>,
     /// Textos de la pantalla Agent usage: (texto, tamaño, negrita, buffer).
-    ov: Vec<(String, f32, bool, Buffer)>, scale: f32, cell: (f32, f32),
+    ov: Vec<(String, f32, bool, Buffer)>, scale: f32, cell: (f32, f32), font: f32,
+    /// Barra de búsqueda abierta: (panel, su texto).
+    find_bar: Option<(u64, Buffer)>,
+    /// Paleta de comandos abierta: (filas de texto, la resaltada).
+    pal: Option<(Vec<Buffer>, usize)>,
 }
 
+/// Todo lo que cambia el dibujo de un panel. Si algo nuevo influye en cómo se ve, va aquí.
+#[derive(PartialEq)]
+struct PaneKey {
+    id: u64, version: u64, size: (usize, usize), rect: R, dy: f32, cell: (f32, f32), scale: f32,
+    offset: usize, gap: usize, solid: bool, selection: Option<SelectionRange>, link: Option<(Point, usize)>,
+}
+
+/// Un panel ya dibujado.
+struct Drawn { key: PaneKey, rects: Vec<Inst> }
+
+/// Una celda lista para pintar: columna, ancho, carácter, color, fondo y negrita.
+type Cell = (usize, usize, char, Rgb, Rgb, bool);
+
+/// Un renglón ya dibujado: vale mientras no cambien sus celdas ni dónde cae (rect, bajada, celda y escala).
+struct Row { at: (R, f32, (f32, f32), f32), cells: Vec<Cell>, spans: Vec<Span>, rects: Vec<Inst>, text: std::cell::OnceCell<Vec<render::Op>> }
+
 struct Pane {
-    id: u64, session: Session, anchor: Option<Point>, bufs: Vec<Buffer>, prev: Vec<Option<Vec<Span>>>,
-    chip_rect: Option<[f32; 4]>, cols: usize, rows: usize, rect: R, dy: f32, merged: Option<usize>, gap: usize, cleared: bool, asleep: bool, last_busy: Instant,
+    id: u64, session: Session, anchor: Option<Point>, bufs: Vec<Buffer>, done_rows: Vec<Option<Row>>,
+    chip_rect: Option<[f32; 4]>, cols: usize, rows: usize, rect: R, dy: f32, merged: Option<usize>, gap: usize, cleared: bool, resized: bool, working: Option<Instant>, asking: bool, done: bool, drawn: Option<Drawn>, picked: Option<(Point, Point)>, asleep: bool, last_busy: Instant,
     born: Instant, last_out: Instant, unread: bool, agent: sb::Agent, had_agent: bool, project: String,
     token: Option<String>, dir: String, cwd: String,
+    /// % de contexto que muestra su pie (Claude Code); se conserva si deja de verse.
+    ctx: Option<u8>,
 }
 
 impl Pane {
@@ -309,11 +353,13 @@ impl Pane {
         if force || (c, r) != (self.cols, self.rows) {
             (self.cols, self.rows) = (c, r);
             self.bufs = (0..r).map(|_| g.new_buf()).collect();
-            self.prev = vec![None; r];
+            self.done_rows = (0..r).map(|_| None).collect();
+            self.drawn = None;
         }
         self.dy = bottom_dy(inner.3, r, g.cell.1, PAD * g.scale);
         let cur = { let t = self.session.term.lock().unwrap(); (t.columns(), t.screen_lines()) };
-        if (c, r) != cur { self.session.resize(c, r); }
+        if (c, r) != cur { self.session.resize(c, r); self.drawn = None; }
+        self.resized |= c != cur.0;
     }
     /// Agente en primer plano y proyecto (cwd) vía libproc.
     fn refresh(&mut self) {
@@ -368,7 +414,7 @@ impl Tab {
 }
 
 impl Gfx {
-    fn metrics(&self) -> Metrics { Metrics::new(FONT_SIZE * self.scale, (FONT_SIZE * self.scale * 1.2).round()) }
+    fn metrics(&self) -> Metrics { Metrics::new(self.font * self.scale, (self.font * self.scale * 1.2).round()) }
     fn bar_metrics(&self) -> Metrics { Metrics::new(11.0 * self.scale, (14.0 * self.scale).round()) }
     fn new_buf(&mut self) -> Buffer {
         let m = self.metrics();
@@ -395,7 +441,7 @@ impl Gfx {
         self.chip = b;
         // Glifos sueltos de la barra de pestañas: vacío (para los íconos de línea), + y x.
         let bm = self.bar_metrics();
-        self.icons = ["", "+", "×"].iter().chain(marquee::SPINNER.iter()).map(|t| {
+        self.icons = ["", "+", "×"].iter().map(|t| {
             let mut b = Buffer::new(&mut self.fs, bm);
             b.set_size(Some(40.0 * self.scale), Some(bm.line_height));
             b.set_text(t, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
@@ -427,14 +473,93 @@ fn fill_gap<L: EventListener>(t: &Term<L>, cleared: &mut bool) -> usize {
     if *cleared { 0 } else { view_gap(t) }
 }
 
-/// Tras `/clear` Claude Code repinta desde arriba pero no pide borrar el historial: se borra aquí, como en una
-/// sesión nueva. Solo con su cabecera en la primera fila (aún no ha subido nada de la charla nueva) y el `/clear` a la vista.
+/// Tras `/clear` Claude Code deja arriba lo que había antes de su cabecera y no pide borrar el historial: aquí la
+/// cabecera sube a la primera fila y se borra el historial. Solo con la cabecera y el `/clear` a la vista.
 fn forget_on_clear<L: EventListener>(t: &mut Term<L>) {
-    if t.mode().contains(TermMode::ALT_SCREEN) || t.grid().history_size() == 0 { return; }
-    let row = |l: usize| (0..t.columns()).map(|c| t.grid()[Line(l as i32)][Column(c)].c).collect::<String>();
-    if row(0).contains("Claude Code v") && (1..t.screen_lines()).any(|l| row(l).trim_end() == "❯ /clear") {
-        t.grid_mut().clear_history();
+    if t.mode().contains(TermMode::ALT_SCREEN) { return; }
+    let row = |l: i32| (0..t.columns()).map(|c| t.grid()[Line(l)][Column(c)].c).collect::<String>();
+    let rows = t.screen_lines() as i32;
+    let Some(clear) = (1..rows).rev().find(|&l| row(l).trim_end() == "❯ /clear") else { return };
+    let Some(head) = (0..clear).rev().find(|&l| row(l).contains("Claude Code v")) else { return };
+    if head > 0 {
+        // Claude mueve el cursor en relativo: sube junto con el texto.
+        if t.grid().cursor.point.line.0 < head { return; }
+        let g = t.grid_mut();
+        g.scroll_up(&(Line(0)..Line(rows)), head as usize);
+        g.cursor.point.line = g.cursor.point.line - head;
     }
+    t.grid_mut().clear_history();
+}
+
+/// Al cambiar el ancho, las líneas se reacomodan y Claude Code repinta desde arriba sin borrar el historial: queda
+/// una copia vieja. Si su cabecera vuelve a la primera fila, la charla entera está en pantalla y el historial sobra.
+/// En una charla larga la cabecera no está y no se toca nada.
+fn forget_after_resize<L: EventListener>(t: &mut Term<L>, resized: &mut bool) {
+    if !*resized || t.mode().contains(TermMode::ALT_SCREEN) || t.grid().history_size() == 0 { return; }
+    let first: String = (0..t.columns()).map(|c| t.grid()[Line(0)][Column(c)].c).collect();
+    if first.contains("Claude Code v") {
+        t.grid_mut().clear_history();
+        *resized = false;
+    }
+}
+
+/// ⌘A: selecciona solo lo escrito tras el `❯` (cuadro de Claude Code o línea del shell), para copiarlo con ⌘C.
+/// Sin ese prompt junto al cursor, vacío o con la sugerencia atenuada, no selecciona nada.
+fn select_input<L: EventListener>(t: &mut Term<L>) {
+    t.selection = None;
+    let g = t.grid();
+    let (cur, last_col) = (g.cursor.point.line.0, t.last_column());
+    let first = |l: i32| g[Line(l)][Column(0)].c;
+    let Some(start) = (0..=cur).rev().find(|&l| first(l) == '❯') else { return };
+    let boxed = start > 0 && first(start - 1) == '─';
+    let mut end = start;
+    while end + 1 < t.screen_lines() as i32
+        && if boxed { first(end + 1) != '─' } else { g[Line(end)][last_col].flags.contains(Flags::WRAPLINE) } { end += 1; }
+    if cur > end || g[Line(start)][Column(2)].flags.contains(Flags::DIM) { return; }
+    let written = |l: i32| (if l == start { 2 } else { 0 }..t.columns()).rev().find(|&c| !g[Line(l)][Column(c)].c.is_whitespace());
+    let Some((line, col)) = (start..=end).rev().find_map(|l| Some((l, written(l)?))) else { return };
+    let mut s = Selection::new(SelectionType::Simple, Point::new(Line(start), Column(2)), Side::Left);
+    s.update(Point::new(Line(line), Column(col)), Side::Right);
+    t.selection = Some(s);
+}
+
+/// Texto a copiar. Si es lo escrito tras `❯`, sin la sangría que Claude Code pone en las líneas siguientes.
+fn selected_text<L: EventListener>(t: &Term<L>) -> Option<String> {
+    let text = t.selection_to_string()?;
+    let from = t.selection.as_ref()?.to_range(t)?.start;
+    let input = from.column.0 == 2 && t.grid()[from.line][Column(0)].c == '❯';
+    Some(if input { text.replace("\n  ", "\n") } else { text })
+}
+
+/// Filas de Processes (`k` = 0) o Ports (`k` = 1).
+fn proc_rows(side: &sb::Side, k: usize) -> Vec<procs::Row> {
+    let s = side.mon.snap.lock().unwrap();
+    let q = &side.lists[k].query;
+    if k == 1 { procs::port_rows(&s.procs, &s.listen, q) } else { procs::rows(&s.procs, &s.ports, side.psort, q) }
+}
+
+fn local_url(r: &procs::Row) -> String { format!("http://localhost:{}", r.port.unwrap_or(0)) }
+
+/// Marca desde cuándo trabaja un agente; `true` cuando deja de hacerlo tras al menos 10 s (menos es ruido).
+fn finished(since: &mut Option<Instant>, working: bool, now: Instant) -> bool {
+    if working { since.get_or_insert(now); false } else { since.take().is_some_and(|t| now.duration_since(t).as_secs() >= 10) }
+}
+
+/// Notificación de macOS; los textos van como argumentos, nunca dentro del script.
+fn notify(title: &str, body: &str) {
+    if let Ok(mut c) = Command::new("osascript").args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv) sound name \"Glass\"", "-e", "end run", title, body]).spawn() {
+        std::thread::spawn(move || { let _ = c.wait(); });
+    }
+}
+
+/// Extremos de la selección, para saber si sigue siendo la que hizo ⌘A.
+fn span<L: EventListener>(t: &Term<L>) -> Option<(Point, Point)> { t.selection.as_ref()?.to_range(t).map(|r| (r.start, r.end)) }
+
+/// Lleva el cursor al final y borra hacia atrás `n` caracteres (con margen: lo que sobra no hace nada).
+/// Supr no sirve: zsh sin configurar no la entiende.
+fn erase_bytes(n: usize, app_cursor: bool) -> Vec<u8> {
+    let right: &[u8] = if app_cursor { b"\x1bOC" } else { b"\x1b[C" };
+    [right.repeat(n + 8), vec![0x7f; 2 * (n + 8)]].concat()
 }
 
 /// Una fila por panel de cada pestaña, con su estado actual.
@@ -443,19 +568,27 @@ fn entries(tabs: &[Tab], active_tab: usize) -> Vec<sb::Entry> {
     tabs.iter().enumerate().flat_map(|(ti, t)| t.panes.iter().enumerate().map(move |(pi, p)| {
         let title = p.session.title.lock().unwrap().clone();
         sb::Entry {
-            tab: ti, pane: pi, project: p.project.clone(), agent: p.agent, unread: p.unread, focused: ti == active_tab && pi == t.active,
-            status: sb::status(p.agent, p.had_agent, now.duration_since(p.last_out), &title),
+            tab: ti, pane: pi, project: p.project.clone(), done: p.done, agent: p.agent, unread: p.unread, focused: ti == active_tab && pi == t.active,
+            status: if p.asking { sb::Status::Asking } else if p.working.is_some() { sb::Status::Working } else { sb::status(p.agent, p.had_agent, now.duration_since(p.last_out), &title) },
             title: if p.agent == sb::Agent::Shell || title.is_empty() { p.cwd.clone() } else { sb::clean_title(&title, 200) },
             secs: now.duration_since(p.born).as_secs(),
         }
     })).collect()
 }
 
+/// Toda la pantalla viva del panel, con lo atenuado (los pies de los menús suelen estarlo).
+fn live_rows<L: EventListener>(t: &Term<L>) -> Vec<String> {
+    (0..t.screen_lines()).map(|l| (0..t.columns()).map(|c| t.grid()[Line(l as i32)][Column(c)].c).collect()).collect()
+}
+
 /// Texto que se oculta al dibujar (no se toca lo que llega del pty ni lo que se copia).
-const HIDE_HINT: &str = " (shift+tab to cycle)";
-/// Quita `HIDE_HINT` de una fila y corre a la izquierda lo que seguía (celdas: columna, ancho, carácter, …).
+const HIDE_HINTS: [&str; 2] = [" (shift+tab to cycle)", " · esc to interrupt"];
+/// Quita los `HIDE_HINTS` de una fila y corre a la izquierda lo que seguía (celdas: columna, ancho, carácter, …).
 fn hide_hint<T: Copy>(row: &mut [(usize, usize, char, T, T, bool)]) {
-    let h: Vec<char> = HIDE_HINT.chars().collect();
+    for hint in HIDE_HINTS { hide_text(row, hint); }
+}
+fn hide_text<T: Copy>(row: &mut [(usize, usize, char, T, T, bool)], hint: &str) {
+    let h: Vec<char> = hint.chars().collect();
     if row.len() < h.len() { return; }
     let mut i = 0;
     while i + h.len() <= row.len() {
@@ -483,33 +616,70 @@ fn hide_label<T: Copy>(row: &mut [(usize, usize, char, T, T, bool)]) {
     for c in &mut row[s..last] { (c.2, c.3, c.4, c.5) = ('─', fg, bg, b); }
 }
 
-/// Solo en pantalla: quita el "ctx NN%" del inicio de la barra de estado y lo dibuja como barra fina justo encima
-/// de la raya de arriba del prompt (la segunda hacia arriba), a la derecha; si esa fila está ocupada, sobre la raya.
-/// `col`: etiqueta, tramo vacío, y barra normal, desde 60 % y desde 80 %. Sin las dos rayas no toca nada.
-fn lift_context<T: Copy>(grid: &mut [Vec<(usize, usize, char, T, T, bool)>], col: [T; 5]) {
-    for i in (0..grid.len()).rev() {
-        let t: String = grid[i].iter().map(|c| c.2).collect();
+/// Solo en pantalla: convierte el "ctx NN%" del inicio de la barra de estado en una barra fina en su misma fila
+/// (si no cabe, solo la cifra). `col`: etiqueta, tramo vacío, y barra normal, desde 60 % y desde 80 %.
+fn ctx_bar<T: Copy>(grid: &mut [Vec<(usize, usize, char, T, T, bool)>], col: [T; 5]) {
+    for row in grid.iter_mut().rev() {
+        let t: String = row.iter().map(|c| c.2).collect();
         let s = t.chars().take_while(|c| *c == ' ').count();
-        let Some((num, after)) = t.trim_start().strip_prefix("ctx ").and_then(|r| r.split_once('%')) else { continue };
-        let Ok(p) = num.parse::<u8>() else { continue };
-        let len = 4 + num.len() + 1;
-        let Some(top) = (0..i).rev().filter(|&r| grid[r].len() > 3 && grid[r][..3].iter().all(|c| c.2 == '─')).nth(1) else { return };
+        let Some((p, after)) = ctx_of(&t) else { continue };
         let fill = col[match p { 80.. => 4, 60.. => 3, _ => 2 }];
-        // 10 tramos; desde 1 % ya se ve uno.
-        let n = (p.min(100) as usize).div_ceil(10);
-        let chip: Vec<(char, T)> = " contexto ".chars().map(|c| (c, col[0]))
-            .chain((0..10).map(|k| if k < n { ('━', fill) } else { ('─', col[1]) }))
-            .chain(format!(" {p}% ").chars().map(|c| (c, col[2]))).collect();
-        // Un hueco de una celda a la derecha.
-        let free = |r: usize, ch: char| grid[r].len().checked_sub(chip.len() + 1).filter(|&at| grid[r][at..].iter().all(|c| c.2 == ch && c.1 == 1));
-        let Some((row, at)) = top.checked_sub(1).and_then(|r| Some((r, free(r, ' ')?))).or_else(|| Some((top, free(top, '─')?))) else { return };
-        for (k, (ch, fg)) in chip.into_iter().enumerate() { let d = &mut grid[row][at + k]; (d.2, d.3, d.5) = (ch, fg, false); }
-        let skip = len + after.chars().take_while(|c| *c == ' ').count();
-        for k in s..grid[i].len() {
-            match grid[i].get(k + skip).copied() { Some(c) => { let d = &mut grid[i][k]; (d.2, d.3, d.5) = (c.2, c.3, c.5) } None => grid[i][k].2 = ' ' }
-        }
+        // 8 tramos; desde 1 % ya se ve uno.
+        let n = (p.min(100) as usize * 8).div_ceil(100);
+        let rest: Vec<(char, T, bool)> = row.iter().skip(t.chars().count() - after.chars().count()).map(|c| (c.2, c.3, c.5)).collect();
+        let used = rest.iter().rposition(|c| c.0 != ' ').map_or(0, |i| i + 1);
+        let chip = |bar: bool| -> Vec<(char, T, bool)> {
+            "contexto ".chars().map(|c| (c, col[0], false))
+                .chain((0..if bar { 8 } else { 0 }).map(|k| (if k < n { '━' } else { '─' }, if k < n { fill } else { col[1] }, false)))
+                .chain(format!("{}{p}%", if bar { " " } else { "" }).chars().map(|c| (c, col[2], false))).collect()
+        };
+        let full = chip(true);
+        let new = if s + full.len() + used <= row.len() { full } else { chip(false) };
+        let mut cells = new.into_iter().chain(rest);
+        for d in &mut row[s..] { (d.2, d.3, d.5) = cells.next().unwrap_or((' ', d.3, false)); }
         return;
     }
+}
+
+/// "ctx NN% resto" -> (NN, resto).
+fn ctx_of(line: &str) -> Option<(u8, &str)> {
+    let (num, after) = line.trim_start().strip_prefix("ctx ")?.split_once('%')?;
+    Some((num.parse().ok()?, after))
+}
+
+/// ¿Fila del pie de Claude Code (modo, contexto o uso)? `.1`: es la que lleva la raya de arriba.
+fn footer_row(line: &str) -> Option<bool> {
+    let t = line.trim_start();
+    let meter = t.starts_with("contexto ") || t.starts_with("5h ");
+    let mode = (t.starts_with("▸▸ ") || t.starts_with("⏸ ")) && t.contains(" on");
+    (meter || mode).then(|| meter || t.contains("contexto ") || t.contains("5h "))
+}
+
+/// Las dos rayas que rodean el cuadro de escritura de Claude Code: (fila de arriba, fila de abajo).
+fn input_box<T>(grid: &[Vec<(usize, usize, char, T, T, bool)>], cols: usize) -> Option<(usize, usize)> {
+    let mut rules = (0..grid.len()).rev().filter(|&r| grid[r].len() == cols && grid[r].iter().all(|c| c.2 == '─'));
+    let (b, a) = (rules.next()?, rules.next()?);
+    matches!(grid.get(a + 1)?.first()?.2, '❯' | '!').then_some((a, b))
+}
+
+/// Rect de esquinas redondeadas (radio `r`) hecho de franjas; `under` es el fondo, para suavizar el borde.
+/// Con `bottom` en falso solo se redondean las de arriba.
+fn round(out: &mut Vec<Inst>, (x, y, w, h): R, r: f32, c: Rgb, under: Rgb, bottom: bool) {
+    let (x, y, w, h) = (x.round(), y.round(), w.round(), h.round());
+    let r = r.min(w / 2.0).min(h / 2.0).floor();
+    let n = r as usize;
+    for i in 0..n {
+        let d = r - i as f32 - 0.5;
+        let inset = r - (r * r - d * d).sqrt();
+        let (whole, part) = (inset.ceil(), inset.ceil() - inset);
+        let edge = [0, 1, 2].map(|k| (under[k] as f32 + (c[k] as f32 - under[k] as f32) * part).round() as u8);
+        for (on, ly) in [(true, y + i as f32), (bottom, y + h - 1.0 - i as f32)] {
+            if !on { continue; }
+            rect(out, x + whole, ly, w - 2.0 * whole, 1.0, c);
+            if part > 0.0 { for ex in [x + whole - 1.0, x + w - whole] { rect(out, ex, ly, 1.0, 1.0, edge); } }
+        }
+    }
+    rect(out, x, y + r, w, h - r - if bottom { r } else { 0.0 }, c);
 }
 
 /// Solo en pantalla: da a la línea de uso ("5h ━━── 50% …") los mismos colores que la barra de contexto, mande
@@ -558,7 +728,7 @@ fn merge_status<T: Copy>(grid: &mut Vec<Vec<(usize, usize, char, T, T, bool)>>) 
     };
     for i in 1..grid.len() {
         let (up, down) = (text(&grid[i - 1]), text(&grid[i]));
-        if !up.trim_start().starts_with("5h ") || !(down.contains(" mode on") || down.contains(" edits on")) { continue; }
+        if !(up.trim_start().starts_with("5h ") || up.trim_start().starts_with("contexto ")) || !(down.contains(" mode on") || down.contains(" edits on")) { continue; }
         let (Some((s, e)), Some((m, d))) = (span(&grid[i - 1]), span(&grid[i])) else { continue };
         let n = grid[i].len();
         let Some(at) = n.checked_sub(e - s + m) else { continue };
@@ -578,12 +748,61 @@ fn rect(out: &mut Vec<Inst>, x: f32, y: f32, w: f32, h: f32, c: Rgb) { out.push(
 
 /// Ancho útil (px) del título de una pestaña de ancho `tw`.
 fn title_avail(tw: f32, sc: f32) -> f32 { tw - (28.0 + CLOSE_S + 10.0) * sc }
+/// Semáforo de un agente: (color, texto). Amarillo pide respuesta, blanco trabaja, verde terminó y no lo has visto.
+fn light(e: &sb::Entry) -> Option<(Rgb, &'static str)> {
+    match e.status {
+        sb::Status::Asking => Some(([0xd9, 0xb0, 0x5a], "Needs you")),
+        sb::Status::Working => Some(([0xd4, 0xd4, 0xd4], "Working")),
+        _ => e.done.then_some(([0x5a, 0xc0, 0x6a], "Done")),
+    }
+}
+/// Insignia del logo: (ícono, lado lógico, color). Cometa que orbita al trabajar, punto que late si te necesita, fijo al terminar.
+fn badge(e: &sb::Entry, secs: f32) -> Option<(u16, f32, Rgb)> {
+    let (c, _) = light(e)?;
+    Some(match e.status {
+        sb::Status::Working => (sb::ICON_SPIN + (secs * sb::SPIN_FRAMES as f32) as u16 % sb::SPIN_FRAMES, 10.0, c),
+        sb::Status::Asking => (sb::ICON_DOT, 7.0, pulse(c, secs)),
+        _ => (sb::ICON_DOT, 7.0, c),
+    })
+}
+/// Latido de los puntos del semáforo: el brillo va y viene entre 25 % y 100 % cada 1,2 s.
+fn pulse(c: Rgb, secs: f32) -> Rgb {
+    let k = 0.625 + 0.375 * (secs * std::f32::consts::TAU / 1.2).cos();
+    c.map(|v| (v as f32 * k).round() as u8)
+}
+/// Ancho (px) de `t` en la letra de la barra; se recuerda para no volver a formarlo en cada cuadro.
+fn text_w(fs: &mut FontSystem, m: Metrics, t: &str) -> f32 {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<(String, u32), f32>>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap();
+    let seen = seen.get_or_insert_with(Default::default);
+    if seen.len() > 2000 { seen.clear(); }
+    *seen.entry((t.to_string(), m.font_size.to_bits())).or_insert_with(|| {
+        let mut b = Buffer::new(fs, m);
+        b.set_size(Some(1.0e4), Some(m.line_height));
+        b.set_wrap(Wrap::None);
+        b.set_text(t, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
+        b.shape_until_scroll(fs, false);
+        b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
+    })
+}
+/// `t` recortado con "…" para que quepa en `avail` px.
+fn text_cut(fs: &mut FontSystem, m: Metrics, t: &str, avail: f32) -> String {
+    if text_w(fs, m, t) <= avail { return t.into(); }
+    let mut c: Vec<char> = t.chars().take(200).collect();
+    while c.pop().is_some() {
+        let s = format!("{}…", c.iter().collect::<String>());
+        if text_w(fs, m, &s) <= avail { return s; }
+    }
+    "…".into()
+}
 /// Ancho reservado (px lógicos) a la derecha del título para el ícono del agente.
-const ICON_W: f32 = 20.0;
+const ICON_W: f32 = 28.0;
+/// Lado (px lógicos) de todos los íconos y logos de la interfaz.
+const CHROME_PX: f32 = 16.0;
 
 /// Devuelve `true` si hay carrusel en marcha (pide otro frame). `mt`: segundos desde que el ratón entró a la pestaña.
 /// Pantalla Agent usage ya armada: (área, rects, textos).
-type Ovl = (R, Vec<(R, Rgb)>, Vec<usage_view::Txt>);
+type Ovl = (R, Vec<(R, Rgb)>, Vec<usage_view::Txt>, Vec<usage_view::Logo>);
 
 fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), side: &sb::Side, mt: f32, ovl: Option<Ovl>, link: Option<&Link>) -> bool {
     let bm = g.bar_metrics();
@@ -596,42 +815,40 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     let mut moff = vec![0.0f32; tabs_len];
     let mut center = vec![0.0f32; tabs_len];
     let mut avails = vec![0.0f32; tabs_len];
+    let ents_all = entries(tabs, active_tab);
     for (i, t) in tabs.iter_mut().enumerate() {
         let title = t.title();
-        let avail = title_avail(trs[i].2, g.scale) - if t.panes[t.active].agent.icon().is_some() { ICON_W * g.scale } else { 0.0 };
+        let iw = if t.panes[t.active].agent.icon().is_some() { ICON_W * g.scale } else { 0.0 };
+        let avail = (title_avail(trs[i].2, g.scale) - iw).max(0.0);
         avails[i] = avail;
         if t.ttitle != title {
-            t.tbuf.set_metrics(bm);
-            t.tbuf.set_size(Some(1.0e4), Some(bm.line_height));
-            t.tbuf.set_wrap(Wrap::None);
-            t.tbuf.set_text(&title, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
-            t.tbuf.shape_until_scroll(&mut g.fs, false);
-            t.tfull = t.tbuf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
+            t.tfull = text_w(&mut g.fs, bm, &title);
             t.ttitle = title.clone();
-            t.tprev = title.clone();
+            t.tprev.clear();
         }
         let long = t.tfull > avail;
         let hov = matches!(hover, Some(BarHit::Tab(j) | BarHit::Close(j)) if j == i);
-        let want = if !long || hov { title.clone() } else {
-            // Menlo es monoespaciada: ancho por carácter = ancho total / nº de caracteres.
-            let n = title.chars().count().max(1);
-            let k = ((avail / (t.tfull / n as f32)) as usize).max(1);
-            format!("{}…", title.chars().take(k - 1).collect::<String>())
-        };
+        let want = if hov { title.clone() } else { text_cut(&mut g.fs, bm, &title, avail) };
         if t.tprev != want {
+            t.tbuf.set_metrics(bm);
+            t.tbuf.set_size(Some(1.0e4), Some(bm.line_height));
+            t.tbuf.set_wrap(Wrap::None);
             t.tbuf.set_text(&want, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
             t.tbuf.shape_until_scroll(&mut g.fs, false);
             t.tprev = want;
         }
         if long && hov { moff[i] = marquee::marquee_offset(mt, t.tfull - avail, 35.0 * g.scale, 1.0); animating = true; }
-        if !long { center[i] = (avail - t.tfull) / 2.0; }
+        // Hueco a la izquierda del grupo logo + título.
+        center[i] = (trs[i].2 - iw - text_w(&mut g.fs, bm, &t.tprev).min(avail)) / 2.0;
     }
-    let ents_all = entries(tabs, active_tab);
-    // Pestañas con algún panel en Working: spinner a la izquierda del título y redibujo continuo.
-    let working: Vec<bool> = (0..tabs_len).map(|i| ents_all.iter().any(|e| e.tab == i && e.status == sb::Status::Working)).collect();
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    let spin = marquee::spinner_frame(START.get_or_init(Instant::now).elapsed().as_secs_f32(), 10.0, marquee::SPINNER.len());
-    animating |= working.contains(&true);
+    // El spinner y los puntos del semáforo piden cuadros seguidos.
+    animating |= ents_all.iter().any(|e| light(e).is_some());
+    let secs = START.get_or_init(Instant::now).elapsed().as_secs_f32();
+    // Qué está haciendo cada Claude que trabaja, por (pestaña, panel).
+    let doing: std::collections::HashMap<(usize, usize), String> = ents_all.iter().filter(|e| side.visible && e.agent == sb::Agent::Claude && e.status == sb::Status::Working)
+        .filter_map(|e| Some(((e.tab, e.pane), activity::of(tabs[e.tab].panes[e.pane].token.as_deref()?)?))).collect();
+    let used: std::collections::HashMap<(usize, usize), u8> = tabs.iter().enumerate().flat_map(|(ti, t)| t.panes.iter().enumerate().filter_map(move |(pi, p)| Some(((ti, pi), p.ctx?)))).collect();
     let tab = &mut tabs[active_tab];
     let (cw, ch) = g.cell;
     let pad = PAD * g.scale;
@@ -659,59 +876,75 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
             let gl = std::cell::Cell::new(None);
             let mut put = |t: String, dx: f32, dy: f32, c: Color| stxt.push((t, x + dx * sc, ty + dy * sc, c, gl.take()));
             let logo = |a: sb::Agent, s: f32| { let ic = a.icon(); gl.set(ic.map(|(id, _)| (id, s * sc))); if ic.is_some() { String::new() } else { a.glyph().into() } };
-            let ico = |id: u16| gl.set(Some((id, 16.0 * sc)));
-            let iy = (bm.line_height / sc - 16.0) / 2.0;
+            let ico = |id: u16| gl.set(Some((id, CHROME_PX * sc)));
+            let iy = (bm.line_height / sc - CHROME_PX) / 2.0;
             match hit {
-                sb::Hit::New => { rect(&mut rects, x, y, w, h, BTN_BG); ico(sb::ICON_NEW); put(String::new(), 8.0, iy, lit); put("New session".into(), 30.0, 0.0, lit); put("⇧⌘T".into(), (w - 44.0 * sc) / sc, 0.0, dimc); }
-                sb::Hit::Folder => { rect(&mut rects, x, y, w, h, BTN_BG); ico(sb::ICON_FOLDER); put(String::new(), 6.0, iy, dimc); }
+                sb::Hit::New => { round(&mut rects, r, RADIUS * sc, BTN_BG, SIDE_BG, true); ico(sb::ICON_NEW); put(String::new(), 8.0, iy, lit); put("New session".into(), 30.0, 0.0, lit); put("⇧⌘T".into(), (w - 44.0 * sc) / sc, 0.0, dimc); }
+                sb::Hit::Folder => { round(&mut rects, r, RADIUS * sc, BTN_BG, SIDE_BG, true); ico(sb::ICON_FOLDER); put(String::new(), 6.0, iy, dimc); }
                 sb::Hit::Search => {
                     let t = if side.searching { format!("{}▏", side.query) } else if side.query.is_empty() { "Search agents".into() } else { side.query.clone() };
                     ico(sb::ICON_SEARCH); put(String::new(), 8.0, iy, dimc); put(t, 30.0, 0.0, if side.query.is_empty() && !side.searching { dimc } else { lit });
-                    put("/".into(), (w - 20.0 * sc) / sc, 0.0, dimc);
+                    put("/".into(), (w - 12.0 * sc - bm.font_size * 0.602) / sc, 0.0, dimc);
                 }
                 sb::Hit::Filter(f) => {
-                    if side.filter == f { rect(&mut rects, x + 2.0 * sc, y, w - 4.0 * sc, h, [0x24, 0x24, 0x2a]); }
+                    if side.filter == f { round(&mut rects, (x + 2.0 * sc, y, w - 4.0 * sc, h), RADIUS * sc, [0x24, 0x24, 0x2a], SIDE_BG, true); }
                     let t = match f { sb::Filter::All => format!("All {all}"), sb::Filter::Waiting if wt > 0 => format!("Waiting {wt}"), sb::Filter::Waiting => "Waiting".into(), sb::Filter::Working => format!("Working {wk}") };
-                    put(t, 12.0, 0.0, if side.filter == f { lit } else { dimc });
+                    put(t, 8.0, 0.0, if side.filter == f { lit } else { dimc });
                 }
-                sb::Hit::Group(i) => if let sb::Item::Group(p) = &items[i] { put(p.clone(), 14.0, 0.0, dimc) },
+                sb::Hit::Group(i) => if let sb::Item::Group(p) = &items[i] { put(p.clone(), 16.0, 0.0, dimc) },
                 sb::Hit::Row(j) => {
                     let e = &ents[j];
-                    if e.focused { rect(&mut rects, x + 6.0 * sc, y, w - 12.0 * sc, h, [0x1a, 0x1a, 0x20]); }
+                    if e.focused { round(&mut rects, (x + 6.0 * sc, y + sc, w - 12.0 * sc, h - 2.0 * sc), RADIUS * sc, [0x1a, 0x1a, 0x20], SIDE_BG, true); }
+                    // 2: barra fina con el contexto gastado de la sesión.
+                    if let Some(&p) = used.get(&(e.tab, e.pane)) {
+                        let (bx, by, bw, bh) = (x + 38.0 * sc, y + h - 5.0 * sc, w - 54.0 * sc, 2.0 * sc);
+                        rect(&mut rects, bx, by, bw, bh, [0x2a, 0x2a, 0x30]);
+                        let fill = match p { 80.. => [0xe0, 0x60, 0x60], 60.. => [0xe0, 0xa0, 0x40], _ => [0x8a, 0x8a, 0x94] };
+                        rect(&mut rects, bx, by, (bw * p.min(100) as f32 / 100.0).max(2.0 * sc), bh, fill);
+                    }
                     let c = e.agent.color();
-                    let st = match e.status { sb::Status::Done => Color::rgb(0x5a, 0xc0, 0x6a), _ => dimc };
-                    let t = logo(e.agent, 18.0); put(t, 16.0, -9.0 + (bm.line_height / sc - 18.0) / 2.0, Color::rgb(c[0], c[1], c[2]));
-                    if e.unread { put("●".into(), 8.0, -12.0, Color::rgb(0x5a, 0xc0, 0x6a)); }
+                    let t = logo(e.agent, CHROME_PX); put(t, 16.0, -9.0 + iy, Color::rgb(c[0], c[1], c[2]));
+                    let badge = badge(e, secs).or_else(|| e.unread.then_some((sb::ICON_DOT, 7.0, [0x5a, 0xc0, 0x6a])));
+                    if let Some((icon, size, c)) = badge {
+                        let bg = if e.focused { [0x1a, 0x1a, 0x20] } else { SIDE_BG };
+                        for (id, d, c) in [(sb::ICON_DOT, 12.0, bg), (icon, size, c)] {
+                            gl.set(Some((id, d * sc)));
+                            put(String::new(), 31.0 - d / 2.0, -9.0 + iy + 2.0 - d / 2.0, Color::rgb(c[0], c[1], c[2]));
+                        }
+                    }
                     // Título largo: recortado con "…"; con el ratón encima se muestra entero y se desplaza.
                     let avail = w - 82.0 * sc;
-                    let charw = bm.font_size * 0.602;
-                    let n = e.title.chars().count();
-                    let long = n as f32 * charw > avail;
+                    let long = text_w(&mut g.fs, bm, &e.title) > avail;
                     let hov = long && inside((x, y, w, h), mouse);
                     if hov { shov = Some(j); }
-                    let shown = if !long || hov { e.title.clone() } else {
-                        let k = ((avail / charw) as usize).max(2);
-                        format!("{}…", e.title.chars().take(k - 1).collect::<String>())
-                    };
+                    let shown = if hov { e.title.clone() } else { text_cut(&mut g.fs, bm, &e.title, avail) };
                     if long { sclip.insert(((x + 38.0 * sc).to_bits(), (ty + -9.0 * sc).to_bits()), (x + 38.0 * sc, x + w - 44.0 * sc, hov)); }
+                    let el = sb::fmt_elapsed(e.secs); let elx = (w - 16.0 * sc - text_w(&mut g.fs, bm, &el)) / sc;
                     put(shown, 38.0, -9.0, lit);
-                    put(sb::fmt_elapsed(e.secs), (w - 40.0 * sc) / sc, -9.0, dimc);
-                    put(if e.status == sb::Status::Working { format!("{} Working", marquee::SPINNER[spin]) } else { e.status.label().into() }, 38.0, 7.0, st);
+                    put(el, elx, -9.0, dimc);
+                    match light(e) {
+                        // El texto queda fijo en su color para leerse bien.
+                        Some((c, label)) => {
+                            let line = doing.get(&(e.tab, e.pane)).map_or_else(|| label.to_string(), |d| text_cut(&mut g.fs, bm, d, w - 54.0 * sc));
+                            put(line, 38.0, 7.0, if e.status == sb::Status::Working { dimc } else { Color::rgb(c[0], c[1], c[2]) })
+                        }
+                        None => put(e.status.label().into(), 38.0, 7.0, if e.status == sb::Status::Done { Color::rgb(0x5a, 0xc0, 0x6a) } else { dimc }),
+                    }
                 }
                 sb::Hit::Launch(i) => {
                     let a = sb::LAUNCH[i].0;
                     let c = if side.installed[i] { a.color() } else { [0x3a, 0x3a, 0x42] };
-                    let t = logo(a, 18.0); put(t, 6.0, (bm.line_height / sc - 18.0) / 2.0, Color::rgb(c[0], c[1], c[2]));
+                    let t = logo(a, CHROME_PX); put(t, 6.0, iy, Color::rgb(c[0], c[1], c[2]));
                 }
                 // Las filas de Archived se dibujan junto con su encabezado.
                 sb::Hit::ArchRow(_) | sb::Hit::ArchDel(_) => {}
-                sb::Hit::Archived => { ico(sb::ICON_ARCHIVE); put(String::new(), 8.0, iy, dimc); put("Archived".into(), 30.0, 0.0, dimc); put(side.archived.len().to_string(), (w - 24.0 * sc) / sc, 0.0, dimc);
+                sb::Hit::Archived => { ico(sb::ICON_ARCHIVE); put(String::new(), 8.0, iy, dimc); put("Archived".into(), 30.0, 0.0, dimc); let n = side.archived.len().to_string(); let nw = n.len() as f32 * bm.font_size * 0.602; put(n, (w - 12.0 * sc - nw) / sc, 0.0, dimc);
                     if side.open_archived {
                         let rows = sb::archived_rows(&side.archived, SystemTime::now());
                         let tiny = Color::rgb(0x5c, 0x5c, 0x66);
                         for (k, (t, when)) in rows.iter().enumerate() {
                             let ry = sb::arch_y(sz.1 / sc, rows.len(), k) * sc + (sb::ARCH_H * sc - bm.line_height) / 2.0;
-                            stxt.push((t.clone(), 14.0 * sc, ry, tiny, None));
+                            stxt.push((t.clone(), 16.0 * sc, ry, tiny, None));
                             stxt.push((when.clone(), (sb::SIDE_W - 64.0) * sc, ry, tiny, None));
                             stxt.push(("×".into(), (sb::SIDE_W - 24.0) * sc, ry, dimc, None));
                         }
@@ -721,8 +954,9 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
         }
     }
     // Columna derecha: Agents arriba y Processes abajo (cada uno con su encabezado, filas y pie).
-    let (col_a, col_p) = sb::column(sz, g.scale, TABBAR_H * g.scale, side.agents_open, side.procs_open);
-    if col_a.is_some() || col_p.is_some() {
+    let cols = sb::column(sz, g.scale, TABBAR_H * g.scale, side.open_panels());
+    let col_a = cols[0];
+    if cols.iter().any(Option::is_some) {
         let sc = g.scale;
         let lh = bm.line_height;
         let (dimc, lit) = (Color::rgb(0x8a, 0x8a, 0x94), Color::rgb(0xd4, 0xd4, 0xd4));
@@ -733,7 +967,7 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
             let arows = sb::agent_rows(ents_all.clone());
             let ty0 = py + (40.0 * sc - lh) / 2.0;
             rect(&mut rects, px, py + 40.0 * sc - 1.0, pw, 1.0, SEP_COLOR);
-            stxt.push((String::new(), px + 14.0 * sc, py + (40.0 - 16.0) / 2.0 * sc, lit, Some((sb::ICON_ROBOT, 16.0 * sc))));
+            stxt.push((String::new(), px + 14.0 * sc, py + (40.0 - CHROME_PX) / 2.0 * sc, lit, Some((sb::ICON_ROBOT, CHROME_PX * sc))));
             stxt.push(("Agents".into(), px + 38.0 * sc, ty0, lit, None));
             stxt.push((format!("{} working", sb::counts(&arows).2), px + 100.0 * sc, ty0, dimc, None));
             stxt.push(("×".into(), px + pw - 26.0 * sc, ty0, dimc, None));
@@ -744,13 +978,23 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
                 let sb::AHit::Row(i) = hit else { continue };
                 let e = &arows[i];
                 let hov = inside((x, y, w, h), mouse);
-                if (side.col_focus && i == side.agents_sel) || hov { rect(&mut rects, x + 6.0 * sc, y, w - 12.0 * sc, h, [0x1a, 0x1a, 0x20]); }
+                if (side.col_focus && side.kf == 0 && i == side.agents_sel) || hov { rect(&mut rects, x + 6.0 * sc, y, w - 12.0 * sc, h, [0x1a, 0x1a, 0x20]); }
                 let (c, ty) = (e.agent.color(), y + (h - lh) / 2.0);
-                stxt.push((String::new(), x + 16.0 * sc, y + (h - 18.0 * sc) / 2.0, Color::rgb(c[0], c[1], c[2]), e.agent.icon().map(|(id, _)| (id, 18.0 * sc))));
+                stxt.push((String::new(), x + 16.0 * sc, y + (h - CHROME_PX * sc) / 2.0, Color::rgb(c[0], c[1], c[2]), e.agent.icon().map(|(id, _)| (id, CHROME_PX * sc))));
                 stxt.push((e.project.clone(), x + 42.0 * sc, ty - 9.0 * sc, lit, None));
                 stxt.push((sb::fmt_elapsed(e.secs), x + w - 44.0 * sc, ty - 9.0 * sc, dimc, None));
-                let wl = format!("{} Working", marquee::SPINNER[spin]);
-                let (label, col) = match e.status { sb::Status::Working => (wl.as_str(), dimc), sb::Status::Waiting => ("● Waiting for your message", dimc), sb::Status::Done => ("Done", Color::rgb(0x5a, 0xc0, 0x6a)) };
+                if let Some((icon, size, c)) = badge(e, secs) {
+                    let lit_row = (side.col_focus && side.kf == 0 && i == side.agents_sel) || hov;
+                    let bg = if lit_row { [0x1a, 0x1a, 0x20] } else { SIDE_BG };
+                    for (id, d, c) in [(sb::ICON_DOT, 12.0, bg), (icon, size, c)] {
+                        let at = (x + (31.0 - d / 2.0) * sc, y + h / 2.0 - (6.0 + d / 2.0) * sc);
+                        stxt.push((String::new(), at.0, at.1, Color::rgb(c[0], c[1], c[2]), Some((id, d * sc))));
+                    }
+                }
+                let (label, col) = match light(e) {
+                    Some((c, label)) => (label, if e.status == sb::Status::Working { dimc } else { Color::rgb(c[0], c[1], c[2]) }),
+                    None => (if e.status == sb::Status::Done { "Done" } else { "Waiting for your message" }, dimc),
+                };
                 stxt.push((label.into(), x + 42.0 * sc, ty + 7.0 * sc, col, None));
                 if hov { stxt.push(("→".into(), x + w - 28.0 * sc, ty + 7.0 * sc, lit, None)); }
             }
@@ -758,42 +1002,61 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
             rect(&mut rects, px, py + ph - 32.0 * sc, pw, 1.0, SEP_COLOR);
             stxt.push((if armed { "press s again to stop" } else { "↑↓ select   ⏎ go   s stop   esc back" }.into(), px + 14.0 * sc, py + ph - 32.0 * sc + (32.0 * sc - lh) / 2.0, dimc, None));
         }
-        if let Some((px, py, pw, ph)) = col_p {
-            if col_a.is_some() { rect(&mut rects, px, py, pw, 1.0, SEP_COLOR); }
+        for k in 0..2 {
+            let Some((px, py, pw, ph)) = cols[k + 1] else { continue };
+            let list = &side.lists[k];
+            if cols[..=k].iter().any(Option::is_some) { rect(&mut rects, px, py, pw, 1.0, SEP_COLOR); }
             let ty0 = py + (40.0 * sc - lh) / 2.0;
             let (amber, blue) = (Color::rgb(0xe0, 0xa0, 0x40), Color::rgb(0x5a, 0x9c, 0xf0));
             let gb = 1.0 / (1u64 << 30) as f64;
-            let (prows, cpu, used, total) = { let s = side.mon.snap.lock().unwrap(); (procs::rows(&s.procs, &s.ports, side.psort, &side.pquery), s.cpu, s.used, s.total) };
-            stxt.push((String::new(), px + 14.0 * sc, py + (40.0 - 16.0) / 2.0 * sc, lit, Some((sb::ICON_PULSE, 16.0 * sc))));
-            stxt.push(("Processes".into(), px + 38.0 * sc, ty0, lit, None));
-            if total > 0 { stxt.push((format!("CPU {:.0} %  RAM {:.0}/{:.0} GB", cpu, used as f64 * gb, total as f64 * gb), px + 118.0 * sc, ty0, dimc, None)); }
+            let prows = proc_rows(side, k);
+            let (cpu, used, total, sampled) = { let s = side.mon.snap.lock().unwrap(); (s.cpu, s.used, s.total, !s.procs.is_empty()) };
+            let ports = k == 1;
+            stxt.push((String::new(), px + 14.0 * sc, py + (40.0 - CHROME_PX) / 2.0 * sc, lit, Some((if ports { sb::ICON_GLOBE } else { sb::ICON_PULSE }, CHROME_PX * sc))));
+            stxt.push((if ports { "Ports".into() } else { "Processes".into() }, px + 38.0 * sc, ty0, lit, None));
+            if ports { if sampled { stxt.push((format!("{} open", prows.len()), px + 100.0 * sc, ty0, dimc, None)); } }
+            else if total > 0 { stxt.push((format!("CPU {:.0} %  RAM {:.0}/{:.0} GB", cpu, used as f64 * gb, total as f64 * gb), px + 118.0 * sc, ty0, dimc, None)); }
             stxt.push(("×".into(), px + pw - 26.0 * sc, ty0, dimc, None));
             rect(&mut rects, px, py + 40.0 * sc - 1.0, pw, 1.0, SEP_COLOR);
             let sy = py + 40.0 * sc + (28.0 * sc - lh) / 2.0;
-            stxt.push((String::new(), px + 14.0 * sc, py + 40.0 * sc + 6.0 * sc, dimc, Some((sb::ICON_SEARCH, 16.0 * sc))));
-            stxt.push((if side.pquery.is_empty() { "Search…".into() } else { format!("{}▏", side.pquery) }, px + 36.0 * sc, sy, if side.pquery.is_empty() { dimc } else { lit }, None));
+            stxt.push((String::new(), px + 14.0 * sc, py + 40.0 * sc + 6.0 * sc, dimc, Some((sb::ICON_SEARCH, CHROME_PX * sc))));
+            stxt.push((if list.query.is_empty() { "Search…".into() } else { format!("{}▏", list.query) }, px + 36.0 * sc, sy, if list.query.is_empty() { dimc } else { lit }, None));
             let by_cpu = side.psort == procs::Sort::Cpu;
-            stxt.push(("CPU".into(), px + pw - 118.0 * sc, sy, if by_cpu { blue } else { dimc }, None));
-            stxt.push(("Memory".into(), px + pw - 66.0 * sc, sy, if by_cpu { dimc } else { blue }, None));
+            if !ports {
+                stxt.push(("CPU".into(), px + pw - 118.0 * sc, sy, if by_cpu { blue } else { dimc }, None));
+                stxt.push(("Memory".into(), px + pw - 66.0 * sc, sy, if by_cpu { dimc } else { blue }, None));
+            }
             rect(&mut rects, px, py + 68.0 * sc - 1.0, pw, 1.0, SEP_COLOR);
             for ((x, y, w, h), hit) in sb::procs_layout((px, py, pw, ph), sc, prows.len()) {
                 let sb::AHit::Row(i) = hit else { continue };
                 let r = &prows[i];
-                if (side.col_focus && i == side.psel) || inside((x, y, w, h), mouse) { rect(&mut rects, x + 6.0 * sc, y, w - 12.0 * sc, h, [0x1a, 0x1a, 0x20]); }
+                if (side.col_focus && side.kf == k + 1 && i == list.sel) || inside((x, y, w, h), mouse) { rect(&mut rects, x + 6.0 * sc, y, w - 12.0 * sc, h, [0x1a, 0x1a, 0x20]); }
                 let ty = y + (h - lh) / 2.0;
                 let cut = |s: &str, n: usize| { let c: Vec<char> = s.chars().collect(); if c.len() <= n { s.to_string() } else { format!("{}…", c[..n - 1].iter().collect::<String>()) } };
+                if ports {
+                    let armed = list.stop.as_ref().is_some_and(|p| p.0 == r.pid);
+                    stxt.push((format!(":{}", r.port.unwrap_or(0)), x + 14.0 * sc, ty, blue, None));
+                    stxt.push((cut(&r.name, 18), x + 84.0 * sc, ty - 9.0 * sc, lit, None));
+                    stxt.push((cut(&format!("pid {}{}", r.pid, r.parent.as_ref().map_or(String::new(), |p| format!(" · {p}"))), 24), x + 84.0 * sc, ty + 7.0 * sc, dimc, None));
+                    stxt.push((if armed { "¿×?".into() } else { "×".into() }, x + w - 34.0 * sc, ty, if armed { amber } else { dimc }, None));
+                    continue;
+                }
                 stxt.push((cut(&r.name, 22), x + 14.0 * sc, ty - 9.0 * sc, lit, None));
                 if let Some(p) = &r.parent { stxt.push((cut(p, 14), x + 14.0 * sc, ty + 7.0 * sc, dimc, None)); }
                 if let Some(p) = r.port { stxt.push((format!(":{p}"), x + 14.0 * sc + 15.0 * 0.6 * lh, ty + 7.0 * sc, blue, None)); }
                 stxt.push((format!("{:.1} %", r.cpu), x + w - 118.0 * sc, ty - 9.0 * sc, if r.cpu >= 50.0 { amber } else { dimc }, None));
                 stxt.push((procs::fmt_mem(r.rss_kb), x + w - 66.0 * sc, ty - 9.0 * sc, dimc, None));
             }
+            if ports && prows.is_empty() {
+                let msg = if !sampled { "Buscando puertos…" } else if list.query.is_empty() { "No hay puertos abiertos" } else { "Sin resultados" };
+                stxt.push((msg.into(), px + 14.0 * sc, py + 84.0 * sc, dimc, None));
+            }
             let fy = py + ph - 32.0 * sc + (32.0 * sc - lh) / 2.0;
             rect(&mut rects, px, py + ph - 32.0 * sc, pw, 1.0, SEP_COLOR);
-            if let Some((pid, name, ..)) = &side.pstop {
+            if let Some((pid, name, ..)) = &list.stop {
                 stxt.push((format!("¿Terminar {} ({pid})?  ⏎ sí · esc no", name.chars().take(14).collect::<String>()), px + 14.0 * sc, fy, lit, None));
             } else {
-                stxt.push((if side.pchanged { "el proceso cambió" } else if side.pnope { "no permitido" } else { "↑↓ select   ⏎ go   ⌘⌫ stop   ⇥ sort   esc" }.into(), px + 14.0 * sc, fy, dimc, None));
+                stxt.push((if list.changed { "el proceso cambió" } else if list.nope { "no permitido" } else { if ports { "⏎ abrir  ⌘C copiar  ⇥ ir  ⌘⌫ stop" } else { "↑↓ select   ⏎ go   ⌘⌫ stop   ⇥ sort   esc" } }.into(), px + 14.0 * sc, fy, dimc, None));
             }
         }
     }
@@ -812,17 +1075,17 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
             }
         }
     }
-    for (btn, on) in [(BTN_PULSE, side.procs_open), (BTN_ROBOT, side.agents_open), (BTN_GLOBE, false)] {
+    for (btn, on) in [(BTN_PULSE, side.lists[0].open), (BTN_ROBOT, side.agents_open), (BTN_GLOBE, side.lists[1].open)] {
         let r = bar_btn(sz.0, g.scale, btn);
         if on { rect(&mut rects, r.0, r.1, r.2, r.3, [0x16, 0x26, 0x3c]); } else if inside(r, mouse) { rect(&mut rects, r.0, r.1, r.2, r.3, TAB_HOVER); }
     }
     for (i, &t) in trs.iter().enumerate() {
-        if i == active_tab { rect(&mut rects, t.0, t.1, t.2, t.3, TAB_ACTIVE); }
-        else if hover == Some(BarHit::Tab(i)) || hover == Some(BarHit::Close(i)) { rect(&mut rects, t.0, t.1, t.2, t.3, TAB_HOVER); }
-        if i + 1 < trs.len() { rect(&mut rects, t.0 + t.2 - 1.0, 8.0 * g.scale, 1.0, t.3 - 16.0 * g.scale, SEP_COLOR); }
-        if hover == Some(BarHit::Close(i)) { let c = close_rect(t, g.scale); rect(&mut rects, c.0, c.1, c.2, c.3, [0x34, 0x34, 0x3c]); }
+        let shape = (t.0 + 2.0 * g.scale, t.1 + 4.0 * g.scale, t.2 - 4.0 * g.scale, t.3 - 4.0 * g.scale);
+        if i == active_tab { round(&mut rects, shape, RADIUS * g.scale, TAB_ACTIVE, TABBAR_BG, false); }
+        else if hover == Some(BarHit::Tab(i)) || hover == Some(BarHit::Close(i)) { round(&mut rects, shape, RADIUS * g.scale, TAB_HOVER, TABBAR_BG, false); }
+        if hover == Some(BarHit::Close(i)) { let c = close_rect(t, g.scale); round(&mut rects, c, 4.0 * g.scale, [0x34, 0x34, 0x3c], TAB_ACTIVE, true); }
     }
-    if hover == Some(BarHit::Plus) { rect(&mut rects, plus.0, plus.1, plus.2, plus.3, TAB_HOVER); }
+    if hover == Some(BarHit::Plus) { round(&mut rects, (plus.0, plus.1 + 4.0 * g.scale, plus.2, plus.3 - 8.0 * g.scale), RADIUS * g.scale, TAB_HOVER, TABBAR_BG, true); }
     if let [a, b] = &tab.panes[..] {
         let x = a.rect.0 + a.rect.2;
         rect(&mut rects, x, a.rect.1, b.rect.0 - x, a.rect.3, SEP_COLOR);
@@ -836,16 +1099,28 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     let (rx, ry, rw, rh) = p.rect;
     let (ox, oy) = (rx + pad, ry + pad + p.dy);
     let mut grid: Vec<Vec<(usize, usize, char, Rgb, Rgb, bool)>> = vec![vec![]; p.rows];
-    let off;
+    let first_rect = rects.len();
+    let (off, key);
     let mut hollow = None;
     let mut cbar = None;
     let mut under: Vec<(usize, usize, usize, Rgb)> = vec![];
     {
         let mut term = p.session.term.lock().unwrap();
-        if p.agent == sb::Agent::Claude { forget_on_clear(&mut term); }
+        if p.agent == sb::Agent::Claude {
+            forget_on_clear(&mut term);
+            forget_after_resize(&mut term, &mut p.resized);
+        }
         off = term.grid().display_offset();
         // Vista bajada solo para pintar este frame (con el candado tomado); luego vuelve al final.
         p.gap = if p.agent == sb::Agent::Claude { fill_gap(&term, &mut p.cleared) } else { 0 };
+        key = PaneKey {
+            id: p.id, version: p.session.version.load(std::sync::atomic::Ordering::Relaxed), size: (p.cols, p.rows), rect: p.rect, dy: p.dy,
+            cell: g.cell, scale: g.scale, offset: off, gap: p.gap, solid: pi == act,
+            selection: term.selection.as_ref().and_then(|s| s.to_range(&term)),
+            link: link.filter(|l| l.pane == p.id).map(|l| (l.start, l.text.len())),
+        };
+        // Sin cambios (p. ej. solo gira un spinner): se reutiliza lo dibujado.
+        if let Some(d) = p.drawn.as_ref().filter(|d| d.key == key) { rects.extend_from_slice(&d.rects); continue; }
         if p.gap > 0 { term.scroll_display(Scroll::Delta(p.gap as i32)); }
         let content = term.renderable_content();
         let cursor = (content.cursor.shape != CursorShape::Hidden && off == 0).then_some(content.cursor.point);
@@ -880,10 +1155,10 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     // El cursor pasa de filas de la grilla a filas vistas.
     for c in [&mut hollow, &mut cbar] { if let Some(c) = c.as_mut() { c.line.0 += p.gap as i32; } }
 
-    // Solo en pantalla: oculta el aviso "(shift+tab to cycle)" que pinta Claude Code junto al modo.
+    // Solo en pantalla: oculta los avisos que pinta Claude Code junto al modo.
     for row in grid.iter_mut() { hide_hint(row); hide_label(row); }
     let usage_col = [[0x8a, 0x8a, 0x94], [0x3a, 0x3a, 0x42], FG, to_color(AColor::Indexed(3), true), to_color(AColor::Indexed(1), true)];
-    lift_context(&mut grid, usage_col);
+    ctx_bar(&mut grid, usage_col);
     p.merged = merge_status(&mut grid);
     paint_usage(&mut grid, usage_col);
     grid.iter_mut().for_each(|row| paint_images(row));
@@ -894,8 +1169,37 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     }
     let merged = p.merged;
     // Pasada 1: fondos fusionados por tramo. Texto: tramos por (color, negrita).
-    for (r, row) in grid.iter().enumerate() {
+    let at = (p.rect, p.dy, g.cell, g.scale);
+    let claude = p.agent == sb::Agent::Claude;
+    if claude {
+        let sc = g.scale;
+        for (r, row) in grid.iter_mut().enumerate() {
+            if row.first().is_none_or(|c| c.4 != USER_BG_IN) { continue; }
+            for c in row.iter_mut().filter(|c| c.4 == USER_BG_IN) { c.4 = USER_BG; }
+            rect(&mut rects, ox - 4.0 * sc, oy + r as f32 * ch, 4.0 * sc, ch, USER_BG);
+            rect(&mut rects, ox - 4.0 * sc, oy + r as f32 * ch, 2.0 * sc, ch, USER_BAR);
+        }
+        if let Some((a, b)) = input_box(&grid, p.cols) {
+            // Gris = borde normal; con color (modo bash, plan…) se respeta.
+            let fg = grid[a][0].3;
+            let edge = if fg.iter().max().unwrap() - fg.iter().min().unwrap() > 24 { fg } else if pi == act { [0x3d, 0x4c, 0x6e] } else { SEP_COLOR };
+            let (x, y) = (ox - 5.0 * sc, oy + (a as f32 + 0.5) * ch);
+            let (w, h) = (p.cols as f32 * cw + 10.0 * sc, (b - a) as f32 * ch);
+            let line = sc.round().max(1.0);
+            round(&mut rects, (x, y, w, h), 9.0 * sc, edge, BG, true);
+            round(&mut rects, (x + line, y + line, w - 2.0 * line, h - 2.0 * line), 9.0 * sc - line, INPUT_BG, edge, true);
+            for r in [a, b] { for c in grid[r].iter_mut() { c.2 = ' '; } }
+        }
+    }
+    for (r, row) in grid.into_iter().enumerate() {
+        // Renglón igual y en el mismo sitio: ya están sus rects, su texto formado y sus letras.
+        if let Some(d) = p.done_rows[r].as_ref().filter(|d| d.at == at && d.cells == row) { rects.extend_from_slice(&d.rects); continue; }
+        let first = rects.len();
         let y = oy + r as f32 * ch;
+        if let Some(top) = claude.then(|| footer_row(&row.iter().map(|c| c.2).collect::<String>())).flatten() {
+            rect(&mut rects, p.rect.0, y, p.rect.2, ch, TABBAR_BG);
+            if top { rect(&mut rects, p.rect.0, y, p.rect.2, g.scale.round().max(1.0), SEP_COLOR); }
+        }
         let mut i = 0;
         while i < row.len() {
             let bg = row[i].4;
@@ -908,7 +1212,7 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
             i = j;
         }
         let mut spans: Vec<Span> = vec![];
-        for c in row {
+        for c in &row {
             let mut chr = c.2;
             let mut drawn = false;
             // Cajas, bloques, braille y símbolos: se dibujan como rects y el texto deja un espacio.
@@ -935,12 +1239,12 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
             // shortcut: se asume avance de 1 em en la fuente de respaldo (CJK/emoji); el sobrante hasta 2 celdas va como espaciado.
             (t.as_str(), if *wide { a.letter_spacing(wide_ls) } else { a })
         });
-        // Solo se reforma la fila si su contenido cambió respecto al frame anterior.
-        if p.prev[r].as_ref() != Some(&spans) {
+        // El texto solo se vuelve a formar si cambió (un fondo o la posición no lo obligan).
+        if p.done_rows[r].as_ref().map(|d| &d.spans) != Some(&spans) {
             p.bufs[r].set_rich_text(it, &base, Shaping::Advanced, None);
             p.bufs[r].shape_until_scroll(&mut g.fs, false);
-            p.prev[r] = Some(spans);
         }
+        p.done_rows[r] = Some(Row { at, cells: row, spans, rects: rects[first..].to_vec(), text: Default::default() });
     }
     for (r, col, w, fg) in under {
         let r = if merged.is_some_and(|gone| r < gone) { r + 1 } else { r };
@@ -961,9 +1265,16 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
         let w = (CHIP.chars().count() + 2) as f32 * cw;
         p.chip_rect = Some([rx + rw / 2.0 - w / 2.0, ry + rh - pad - ch * 3.0, w, ch * 1.5]);
     }
+    p.drawn = Some(Drawn { key, rects: rects[first_rect..].to_vec() });
     }
     // Agent usage tapa el área de paneles (sus rects van encima de los de la terminal).
-    if let Some((_, ors, _)) = &ovl { for ((x, y, w, h), c) in ors { rect(&mut rects, *x, *y, *w, *h, *c); } }
+    if let Some((_, ors, ..)) = &ovl {
+        for &(r, c) in ors {
+            // Las barras delgadas de modelos y agentes van como píldoras sobre el fondo.
+            let pill = (r.3 - usage_view::PILL_H * g.scale).abs() < 0.5;
+            match usage_view::rounded(c).or(pill.then_some(usage_view::BG)) { Some(under) => round(&mut rects, r, if pill { r.3 / 2.0 } else { 8.0 * g.scale }, c, under, true), None => rect(&mut rects, r.0, r.1, r.2, r.3, c) }
+        }
+    }
     let n_bg = rects.len();
 
     // Chips "Jump to bottom" (pasada 2 de rects + segundo TextRenderer, encima del texto).
@@ -975,27 +1286,38 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     }
     // Texto de la barra: ícono + título (+ x en activa/hover) por pestaña, +, y marcadores a la derecha.
     let (tabs, sc) = (&*tabs, g.scale);
-    let tab = &tabs[active_tab];
     let full = TextBounds { left: 0, top: 0, right: g.w as i32, bottom: (TABBAR_H * sc) as i32 };
     let ty = (TABBAR_H * sc - bm.line_height) / 2.0;
     let (dim_c, lit) = (Color::rgb(0x8a, 0x8a, 0x94), Color::rgb(0xd4, 0xd4, 0xd4));
     let mut bar: Vec<TextArea> = vec![];
     let lg = |id, s: f32, dx: f32, dy: f32, c: Color| [CustomGlyph { id, left: dx, top: dy, width: s, height: s, color: Some(c) }];
-    // Ícono del agente de cada pestaña (Shell no lleva).
-    let ix: Vec<f32> = tabs.iter().enumerate().map(|(i, t)| center[i] + t.tfull.min(title_avail(trs[i].2, sc) - ICON_W * sc) + 5.0 * sc).collect();
-    let tabg: Vec<Option<[CustomGlyph; 1]>> = tabs.iter().enumerate().map(|(i, t)| { let a = t.panes[t.active].agent; let c = a.color(); a.icon().map(|(id, _)| lg(id, 15.0 * sc, ix[i], (bm.line_height - 15.0 * sc) / 2.0, Color::rgb(c[0], c[1], c[2]))) }).collect();
+    // Logo del agente de cada pestaña (Shell no lleva) con la insignia de su panel más urgente.
+    let tabg: Vec<Vec<CustomGlyph>> = tabs.iter().enumerate().map(|(i, t)| {
+        let a = t.panes[t.active].agent;
+        let Some((id, _)) = a.icon() else { return vec![] };
+        let (c, top) = (a.color(), (bm.line_height - CHROME_PX * sc) / 2.0);
+        let mut v = lg(id, CHROME_PX * sc, 0.0, top, Color::rgb(c[0], c[1], c[2])).to_vec();
+        let urgent = ents_all.iter().filter(|e| e.tab == i && light(e).is_some())
+            .min_by_key(|e| match e.status { sb::Status::Asking => 0, sb::Status::Working => 1, _ => 2 });
+        if let Some((badge, d, c)) = urgent.and_then(|e| badge(e, secs)) {
+            let bg = if i == active_tab { TAB_ACTIVE } else if matches!(hover, Some(BarHit::Tab(j) | BarHit::Close(j)) if j == i) { TAB_HOVER } else { TABBAR_BG };
+            for (id, d, c) in [(sb::ICON_DOT, 12.0, bg), (badge, d, c)] {
+                v.extend(lg(id, d * sc, (15.0 - d / 2.0) * sc, top + (2.0 - d / 2.0) * sc, Color::rgb(c[0], c[1], c[2])));
+            }
+        }
+        v
+    }).collect();
     let sideg: Vec<[CustomGlyph; 1]> = stxt.iter().map(|e| match e.4 { Some((id, s)) => lg(id, s, 0.0, 0.0, e.3), None => lg(u16::MAX, 0.0, 0.0, 0.0, e.3) }).collect();
     for (i, (&t, tb)) in trs.iter().zip(tabs).enumerate() {
         let col = if i == active_tab { lit } else { dim_c };
         let b = TextBounds { left: t.0 as i32, top: 0, right: (t.0 + t.2 - (CLOSE_S + 10.0) * sc) as i32, bottom: full.bottom };
-        // Logo de Claude de la pestaña: área aparte, fija mientras el título se desplaza.
-        bar.push(TextArea { buffer: &g.icons[0], left: t.0 + 28.0 * sc, top: ty, bounds: b, default_color: col, custom_glyphs: tabg[i].as_ref().map_or(&[], |g| &g[..]) });
-        if working[i] {
-            bar.push(TextArea { buffer: &g.icons[3 + spin], left: t.0 + 10.0 * sc, top: ty, bounds: b, default_color: Color::rgb(0x5c, 0x5c, 0x66), custom_glyphs: &[] });
-        }
-        // El título (y su carrusel) se recorta entre el spinner y el ícono del agente: nunca los pisa.
-        let tb_b = TextBounds { left: (t.0 + 26.0 * sc) as i32, right: (t.0 + 28.0 * sc + avails[i]) as i32, ..b };
-        bar.push(TextArea { buffer: &tb.tbuf, left: t.0 + 28.0 * sc + center[i] - moff[i], top: ty, bounds: tb_b, default_color: col, custom_glyphs: &[] });
+        let x = t.0 + center[i];
+        let iw = if tabg[i].is_empty() { 0.0 } else { ICON_W * sc };
+        // Logo: área aparte, fija mientras el título se desplaza.
+        bar.push(TextArea { buffer: &g.icons[0], left: x, top: ty, bounds: b, default_color: col, custom_glyphs: &tabg[i] });
+        // El título (y su carrusel) se recorta junto al logo: nunca lo pisa.
+        let tb_b = TextBounds { left: (x + iw) as i32, right: (x + iw + avails[i]) as i32, ..b };
+        bar.push(TextArea { buffer: &tb.tbuf, left: x + iw - moff[i], top: ty, bounds: tb_b, default_color: col, custom_glyphs: &[] });
         if i == active_tab || matches!(hover, Some(BarHit::Tab(j) | BarHit::Close(j)) if j == i) {
             let c = close_rect(t, sc);
             bar.push(TextArea { buffer: &g.icons[2], left: c.0 + 4.0 * sc, top: ty, bounds: full, default_color: lit, custom_glyphs: &[] });
@@ -1003,8 +1325,8 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     }
     bar.push(TextArea { buffer: &g.icons[1], left: plus.0 + 10.0 * sc, top: ty, bounds: full, default_color: dim_c, custom_glyphs: &[] });
     // Sin color propio: toman el de su TextArea (resaltado cuando el panel está abierto).
-    let barg = [sb::ICON_PANEL, sb::ICON_PULSE, sb::ICON_GLOBE, sb::ICON_ROBOT].map(|id| { let mut a = lg(id, 16.0 * sc, 0.0, (bm.line_height - 16.0 * sc) / 2.0, dim_c); a[0].color = None; a });
-    bar.push(TextArea { buffer: &g.icons[0], left: (BAR_LEFT + 2.0) * sc, top: ty, bounds: full, default_color: dim_c, custom_glyphs: &barg[0] });
+    let barg = [sb::ICON_PANEL, sb::ICON_PULSE, sb::ICON_GLOBE, sb::ICON_ROBOT].map(|id| { let mut a = lg(id, CHROME_PX * sc, 0.0, (bm.line_height - CHROME_PX * sc) / 2.0, dim_c); a[0].color = None; a });
+    bar.push(TextArea { buffer: &g.icons[0], left: (BAR_LEFT + 6.0) * sc, top: ty, bounds: full, default_color: dim_c, custom_glyphs: &barg[0] });
     let sb_bounds = TextBounds { left: 0, top: 0, right: (sb::SIDE_W * sc) as i32, bottom: g.h as i32 };
     let col_x = sz.0 - sb::RIGHT_W * sc;
     let col_bounds = TextBounds { left: col_x as i32, top: (TABBAR_H * sc) as i32, right: g.w as i32, bottom: g.h as i32 };
@@ -1018,7 +1340,7 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
         }
     };
     for (((_, x, y, c, ic), (_, b)), gl) in stxt.iter().zip(&g.side).zip(&sideg) {
-        let mut bounds = if *x >= col_x && (side.agents_open || side.procs_open) { col_bounds } else { sb_bounds };
+        let mut bounds = if *x >= col_x && side.open_panels().contains(&true) { col_bounds } else { sb_bounds };
         let mut left = *x;
         if let Some(&(l, r, hov)) = sclip.get(&(x.to_bits(), y.to_bits())) {
             bounds = TextBounds { left: l as i32, right: r as i32, ..sb_bounds };
@@ -1032,13 +1354,13 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     }
     // Pulso, robot y globo arriba a la derecha; resaltados (azul) mientras su panel está abierto.
     let blue_on = Color::rgb(0x6a, 0xa6, 0xff);
-    for (k, btn, on) in [(1, BTN_PULSE, side.procs_open), (3, BTN_ROBOT, side.agents_open), (2, BTN_GLOBE, false)] {
+    for (k, btn, on) in [(1, BTN_PULSE, side.lists[0].open), (3, BTN_ROBOT, side.agents_open), (2, BTN_GLOBE, side.lists[1].open)] {
         let r = bar_btn(sz.0, sc, btn);
         bar.push(TextArea { buffer: &g.icons[0], left: r.0 + 6.0 * sc, top: ty, bounds: full, default_color: if on { blue_on } else { dim_c }, custom_glyphs: &barg[k] });
     }
-    if let Some((a, _, otx)) = &ovl {
+    if let Some((a, _, otx, _)) = &ovl {
         // Un buffer por texto; solo se reforma si cambian texto, tamaño o negrita.
-        for (i, (t, _, _, _, size, bold)) in otx.iter().enumerate() {
+        for (i, (t, _, _, _, size, bold, _)) in otx.iter().enumerate() {
             if i >= g.ov.len() { g.ov.push((String::new(), 0.0, false, Buffer::new(&mut g.fs, bm))); }
             let (k, ks, kb, b) = &mut g.ov[i];
             if k != t || *ks != *size || *kb != *bold {
@@ -1046,28 +1368,42 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
                 b.set_metrics(m);
                 b.set_size(Some(a.2), Some(m.line_height));
                 b.set_wrap(Wrap::None);
-                b.set_text(t, &Attrs::new().family(Family::Name("Menlo")).weight(if *bold { Weight::BOLD } else { Weight::NORMAL }), Shaping::Advanced, None);
+                b.set_text(t, &Attrs::new().family(Family::Name("System Font")).weight(if *bold { Weight::BOLD } else { Weight::NORMAL }), Shaping::Advanced, None);
                 b.shape_until_scroll(&mut g.fs, false);
                 (*k, *ks, *kb) = (t.clone(), *size, *bold);
             }
         }
     }
-    let ob = ovl.as_ref().map(|(a, _, _)| TextBounds { left: a.0 as i32, top: a.1 as i32, right: (a.0 + a.2) as i32, bottom: (a.1 + a.3) as i32 });
-    if let (Some((_, _, otx)), Some(ob)) = (&ovl, ob) {
-        for ((_, x, y, c, ..), (.., b)) in otx.iter().zip(&g.ov) {
-            bar.push(TextArea { buffer: b, left: *x, top: *y, bounds: ob, default_color: Color::rgb(c[0], c[1], c[2]), custom_glyphs: &[] });
+    let ob = ovl.as_ref().map(|(a, ..)| TextBounds { left: a.0 as i32, top: a.1 as i32, right: (a.0 + a.2) as i32, bottom: (a.1 + a.3) as i32 });
+    // Logos de la pantalla de uso: (glifo, x, y); viven hasta que se pinta el texto.
+    let ologos: Vec<([CustomGlyph; 1], f32, f32)> = ovl.iter().flat_map(|o| &o.3).filter_map(|&((x, y, w, _), i)| {
+        use sb::Agent::*;
+        let a = [Claude, Codex, Antigravity, Opencode, Grok, Junie][i];
+        let c = a.color();
+        Some((lg(a.icon()?.0, w, 0.0, 0.0, Color::rgb(c[0], c[1], c[2])), x, y))
+    }).collect();
+    if let (Some((_, _, otx, _)), Some(ob)) = (&ovl, ob) {
+        for ((_, x, y, c, .., right), (.., b)) in otx.iter().zip(&g.ov) {
+            let left = if *right { *x - b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) } else { *x };
+            bar.push(TextArea { buffer: b, left, top: *y, bounds: ob, default_color: Color::rgb(c[0], c[1], c[2]), custom_glyphs: &[] });
         }
+        for (gl, x, y) in &ologos { bar.push(TextArea { buffer: &g.icons[0], left: *x, top: *y, bounds: ob, default_color: Color::rgb(255, 255, 255), custom_glyphs: gl }); }
     }
-    let show_panes = ovl.is_none();
-    let areas = bar.into_iter().chain(tab.panes.iter().filter(move |_| show_panes).flat_map(|p| {
-        let bounds = TextBounds { left: p.rect.0 as i32, top: p.rect.1 as i32, right: (p.rect.0 + p.rect.2) as i32, bottom: (p.rect.1 + p.rect.3) as i32 };
-        p.bufs.iter().enumerate().map(move |(r, b)| TextArea {
-            buffer: b, left: p.rect.0 + pad, top: p.rect.1 + pad + p.dy + r as f32 * ch, bounds,
-            default_color: Color::rgb(0xd4, 0xd4, 0xd4), custom_glyphs: &[] })
-    }));
+    let find_at = tabs.get(active_tab).map(|t| (t.panes[t.active].id, t.panes[t.active].rect));
     g.frame.begin(&mut g.sc);
     for &(x, y, w, h, c) in &rects[..n_bg] { g.frame.rect(x, y, w, h, c); }
-    g.frame.text(areas, &mut g.fs, &mut g.sc);
+    g.frame.text(bar.into_iter(), &mut g.fs, &mut g.sc);
+    for p in tabs[active_tab].panes.iter().filter(|_| ovl.is_none()) {
+        let bounds = TextBounds { left: p.rect.0 as i32, top: p.rect.1 as i32, right: (p.rect.0 + p.rect.2) as i32, bottom: (p.rect.1 + p.rect.3) as i32 };
+        for (r, (b, d)) in p.bufs.iter().zip(&p.done_rows).enumerate() {
+            let Some(d) = d else { continue };
+            if let Some(ops) = d.text.get() { g.frame.ops.extend_from_slice(ops); continue; }
+            let start = g.frame.ops.len();
+            g.frame.text(std::iter::once(TextArea { buffer: b, left: p.rect.0 + pad, top: p.rect.1 + pad + p.dy + r as f32 * ch, bounds,
+                default_color: Color::rgb(0xd4, 0xd4, 0xd4), custom_glyphs: &[] }), &mut g.fs, &mut g.sc);
+            let _ = d.text.set(g.frame.ops[start..].to_vec());
+        }
+    }
     for &(x, y, w, h, c) in &rects[n_bg..] { g.frame.rect(x, y, w, h, c); }
     let bounds = TextBounds { left: 0, top: 0, right: g.w as i32, bottom: g.h as i32 };
     let chip = &g.chip;
@@ -1075,10 +1411,57 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
         buffer: chip, left: x + cw, top: y + ch * 0.25, bounds,
         default_color: Color::rgb(0xd4, 0xd4, 0xd4), custom_glyphs: &[] });
     g.frame.text(areas, &mut g.fs, &mut g.sc);
+    if let Some((_, b)) = g.find_bar.as_ref().filter(|f| Some(f.0) == find_at.map(|a| a.0)) {
+        let (_, (px, py, pw, _)) = find_at.unwrap();
+        let (sc, lh) = (g.scale, b.metrics().line_height);
+        let w = (b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) + 24.0 * sc).min(pw - 16.0 * sc);
+        let (x, y, h) = (px + pw - w - 8.0 * sc, py + 8.0 * sc, lh + 12.0 * sc);
+        g.frame.rect(x - sc, y - sc, w + 2.0 * sc, h + 2.0 * sc, [0x3a, 0x3a, 0x42]);
+        g.frame.rect(x, y, w, h, [0x16, 0x16, 0x1a]);
+        let bounds = TextBounds { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
+        g.frame.text(std::iter::once(TextArea { buffer: b, left: x + 12.0 * sc, top: y + 6.0 * sc, bounds,
+            default_color: Color::rgb(0xd4, 0xd4, 0xd4), custom_glyphs: &[] }), &mut g.fs, &mut g.sc);
+    }
+    if let Some((rows, hi)) = &g.pal {
+        let sc = g.scale;
+        let (x, y, w, rh) = palette::geom(g.w as f32, sc, bm.line_height);
+        let h = rh * rows.len() as f32;
+        g.frame.rect(x - sc, y - sc, w + 2.0 * sc, h + 2.0 * sc, [0x3a, 0x3a, 0x42]);
+        g.frame.rect(x, y, w, h, [0x16, 0x16, 0x1a]);
+        g.frame.rect(x, y + rh - sc, w, sc, SEP_COLOR);
+        if *hi > 0 { g.frame.rect(x, y + *hi as f32 * rh, w, rh, [0x2a, 0x2a, 0x32]); }
+        let bounds = TextBounds { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
+        let areas = rows.iter().enumerate().map(|(i, b)| TextArea { buffer: b, left: x + 12.0 * sc, top: y + i as f32 * rh + 6.0 * sc, bounds,
+            default_color: Color::rgb(0xd4, 0xd4, 0xd4), custom_glyphs: &[] });
+        g.frame.text(areas, &mut g.fs, &mut g.sc);
+    }
     let (bands, ops) = g.frame.bands(g.h as usize);
     let (frame, fs, sc) = (&g.frame, &mut g.fs, &mut g.sc);
     g.busy = !g.screen.present(&bands, |px, stride, i| frame.paint_band(px, stride, i, &ops[i], BG, fs, sc));
     animating
+}
+
+/// `font.txt`: tamaño de letra; si no es válido, el normal.
+fn parse_font(text: &str) -> f32 { text.trim().parse::<f32>().ok().filter(|f| (FONT_RANGE.0..=FONT_RANGE.1).contains(f)).unwrap_or(FONT_SIZE) }
+
+/// Coincidencia de `q` (sin distinguir mayúsculas) en el panel e historial: la anterior (`up`) o siguiente a `from`, dando la vuelta.
+// shortcut: no encuentra texto partido entre dos renglones; unir las líneas envueltas si hace falta.
+fn find_match<L: EventListener>(t: &Term<L>, q: &str, from: Option<Point>, up: bool) -> Option<(Point, Point)> {
+    let low = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let q: Vec<char> = q.chars().map(low).collect();
+    if q.is_empty() { return None; }
+    let mut all = vec![];
+    for l in t.topmost_line().0..=t.bottommost_line().0 {
+        let row: Vec<char> = (0..t.columns()).map(|c| low(t.grid()[Line(l)][Column(c)].c)).collect();
+        all.extend(row.windows(q.len()).enumerate().filter(|(_, w)| *w == q.as_slice())
+            .map(|(c, _)| (Point::new(Line(l), Column(c)), Point::new(Line(l), Column(c + q.len() - 1)))));
+    }
+    let next = match (from, up) {
+        (Some(p), true) => all.iter().rev().find(|m| m.0 < p),
+        (Some(p), false) => all.iter().find(|m| m.0 > p),
+        (None, _) => None,
+    };
+    next.or(if up { all.last() } else { all.first() }).copied()
 }
 
 /// `window.txt`: "x y ancho alto" en puntos; None si falta algo o el tamaño no es razonable.
@@ -1120,14 +1503,15 @@ fn init_gfx(el: &ActiveEventLoop) -> Gfx {
     let nerd = [format!("{home}/Library/Fonts"), "/Library/Fonts".into()].into_iter()
         .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()))
         .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().contains("Nerd")));
-    let sys = ["/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Apple Symbols.ttf", "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
-        "/System/Library/Fonts/SFNSMono.ttf", "/System/Library/Fonts/Apple Color Emoji.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    let sys = ["/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/Apple Symbols.ttf", "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
+        "/System/Library/Fonts/SFNSMono.ttf", "/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/Apple Color Emoji.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/AppleSDGothicNeo.ttc", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"].map(std::path::PathBuf::from);
     for p in sys.into_iter().chain(nerd) { let _ = db.load_font_file(p); }
     let fs = FontSystem::new_with_locale_and_db("en-US".into(), db);
     let mut g = Gfx {
         window, screen, w: sz.width.max(1), h: sz.height.max(1), fs, sc: SwashCache::new(), frame: Default::default(), busy: false,
-        chip: Buffer::new_empty(Metrics::new(1.0, 1.0)), icons: vec![], side: vec![], ov: vec![], scale: 1.0, cell: (8.0, 16.0) };
+        chip: Buffer::new_empty(Metrics::new(1.0, 1.0)), icons: vec![], side: vec![], ov: vec![], scale: 1.0, cell: (8.0, 16.0), find_bar: None, pal: None,
+        font: data_file("font.txt").and_then(|f| std::fs::read_to_string(f).ok()).map_or(FONT_SIZE, |t| parse_font(&t)) };
     g.screen.resize(g.w as usize, g.h as usize, g.window.scale_factor());
     g.relayout();
     g
@@ -1160,7 +1544,7 @@ fn toggle_action(fullscreen: bool, restore_some: bool, is_max: bool) -> TogAct {
 struct App {
     g: Option<Gfx>, tabs: Vec<Tab>, active_tab: usize, next_id: u64, proxy: EventLoopProxy<Ev>,
     mods: ModifiersState, mouse: (f32, f32), scroll_acc: f32, drag_sep: bool, mouse_fwd: bool, hidden: bool, last_draw: Instant, last_input: Instant, next_frame: Option<Instant>, peek: Peek,
-    picking: bool, mq: (Option<usize>, Instant),
+    picking: bool, focused: bool, find: Option<String>, pal: Option<palette::Palette>, mq: (Option<usize>, Instant),
     side: sb::Side, last_bar_click: Option<(Instant, (f32, f32))>, last_sep_click: Option<(Instant, (f32, f32))>, ticks: u32,
     restore: Option<(winit::dpi::PhysicalPosition<i32>, winit::dpi::PhysicalSize<u32>)>,
     uv: usage_view::View,
@@ -1204,17 +1588,182 @@ impl App {
     fn area(&self) -> R {
         let g = self.g.as_ref().unwrap();
         let (top, left) = (TABBAR_H * g.scale, if self.side.visible { sb::SIDE_W * g.scale } else { 0.0 });
-        let right = if self.side.agents_open || self.side.procs_open { sb::RIGHT_W * g.scale } else { 0.0 };
+        let right = if self.side.open_panels().contains(&true) { sb::RIGHT_W * g.scale } else { 0.0 };
         (left, top, (g.w as f32 - left - right).max(1.0), (g.h as f32 - top).max(1.0))
     }
+    /// ⌘+ / ⌘- cambian la letra de a un punto; ⌘0 (`None`) la normal.
+    fn set_font(&mut self, step: Option<f32>) {
+        let Some(g) = self.g.as_mut() else { return };
+        g.font = step.map_or(FONT_SIZE, |d| (g.font + d).clamp(FONT_RANGE.0, FONT_RANGE.1));
+        save_file("font.txt", &g.font.to_string());
+        self.sync_size(true);
+        self.redraw();
+    }
+    /// Busca desde la coincidencia actual, la selecciona, la trae a la vista y actualiza la barra.
+    fn search(&mut self, again: bool, up: bool) {
+        let query = self.find.clone().unwrap_or_default();
+        let p = self.pane();
+        let id = p.id;
+        let found = {
+            let mut t = p.session.term.lock().unwrap();
+            let from = t.selection.as_ref().and_then(|s| s.to_range(&t)).filter(|_| again).map(|r| r.start);
+            let m = find_match(&t, &query, from, up);
+            t.selection = m.map(|(a, b)| { let mut s = Selection::new(SelectionType::Simple, a, Side::Left); s.update(b, Side::Right); s });
+            if let Some((a, _)) = m { t.scroll_to_point(a); }
+            m.is_some()
+        };
+        let note = if query.is_empty() || found { "⏎ anterior  ⇧⏎ siguiente  esc" } else { "sin resultados  esc" };
+        let Some(g) = self.g.as_mut() else { return };
+        let m = g.bar_metrics();
+        let mut b = Buffer::new(&mut g.fs, m);
+        b.set_size(None, Some(m.line_height));
+        b.set_text(&format!("Buscar: {query}▏   {note}"), &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
+        b.shape_until_scroll(&mut g.fs, false);
+        g.find_bar = Some((id, b));
+        self.redraw();
+    }
+    fn close_find(&mut self) {
+        if self.find.take().is_none() { return; }
+        if let Some(g) = self.g.as_mut() { g.find_bar = None; }
+        let mut t = self.pane().session.term.lock().unwrap();
+        t.selection = None;
+        t.scroll_display(Scroll::Bottom);
+        drop(t);
+        self.redraw();
+    }
+    fn find_key(&mut self, ev: &winit::event::KeyEvent) {
+        let Some(q) = self.find.as_mut() else { return };
+        match &ev.logical_key {
+            Key::Named(NamedKey::Escape) => return self.close_find(),
+            Key::Named(NamedKey::Enter) => { let up = !self.mods.shift_key(); return self.search(true, up); }
+            Key::Named(NamedKey::Backspace) => { q.pop(); }
+            _ => if let Some(t) = &ev.text { q.extend(t.chars().filter(|c| !c.is_control())); } else { return },
+        }
+        self.search(false, true);
+    }
     fn redraw(&self) { if let Some(g) = &self.g { g.window.request_redraw(); } }
+    /// ⌘D: segundo panel en la pestaña activa (máximo dos).
+    fn split(&mut self) {
+        if self.tabs[self.active_tab].panes.len() >= 2 { return; }
+        let p = self.new_pane(None, None);
+        let t = &mut self.tabs[self.active_tab];
+        t.panes.push(p);
+        t.active = 1;
+        t.split = 0.5;
+        self.sync_size(false);
+        self.redraw();
+    }
+    /// ⌘J: salta al siguiente agente que pide respuesta o que terminó sin que lo vieras.
+    fn go_attention(&mut self) {
+        let at: Vec<(usize, usize)> = self.tabs.iter().enumerate().flat_map(|(ti, t)| (0..t.panes.len()).map(move |pi| (ti, pi))).collect();
+        let flags: Vec<(bool, bool)> = at.iter().map(|&(ti, pi)| { let p = &self.tabs[ti].panes[pi]; (p.asking, p.done) }).collect();
+        let now = at.iter().position(|&x| x == (self.active_tab, self.tabs[self.active_tab].active)).unwrap_or(0);
+        let Some(i) = sb::next_attention(&flags, now) else { return };
+        let (ti, pi) = at[i];
+        (self.side.focus, self.side.col_focus, self.uv.open) = (false, false, false);
+        self.active_tab = ti;
+        self.tabs[ti].active = pi;
+        self.redraw();
+    }
+    fn open_palette(&mut self) {
+        self.close_find();
+        let item = |label: String, hint, cmd| palette::Item { label, hint, cmd };
+        let mut items = vec![];
+        if self.tabs.iter().flat_map(|t| &t.panes).any(|p| p.asking || p.done) { items.push(item("Ir al agente que te necesita".into(), "⌘J", palette::Cmd::Attention)); }
+        for (i, t) in self.tabs.iter().enumerate().filter(|(i, _)| *i != self.active_tab) {
+            let mark = if t.panes.iter().any(|p| p.asking) { "  ● pide respuesta" } else if t.panes.iter().any(|p| p.done) { "  ● terminó" } else { "" };
+            items.push(item(format!("Pestaña {}: {}{mark}", i + 1, t.title()), "", palette::Cmd::Tab(i)));
+        }
+        items.extend(palette::ACTIONS.iter().map(|&(l, h, c)| item(l.into(), h, c)));
+        items.extend(sb::LAUNCH.iter().enumerate().filter(|(i, _)| self.side.installed[*i]).map(|(i, (_, bin))| item(format!("Abrir {bin}"), "", palette::Cmd::Launch(i))));
+        items.extend(self.side.archived.iter().rev().enumerate().map(|(k, a)| item(format!("Retomar: {} · {}", a.title, a.project), "", palette::Cmd::Restore(k))));
+        self.pal = Some(palette::Palette { items, ..Default::default() });
+        self.show_palette();
+    }
+    /// Rehace el texto de la paleta tras abrirla, escribir o mover la selección.
+    fn show_palette(&mut self) {
+        let Some(g) = self.g.as_mut() else { return };
+        g.pal = self.pal.as_ref().map(|p| {
+            let m = g.bar_metrics();
+            let (_, _, w, _) = palette::geom(g.w as f32, g.scale, m.line_height);
+            let cols = ((w - 24.0 * g.scale) / (m.font_size * 0.602)) as usize;
+            let found = p.found();
+            let mut text = vec![format!("› {}▏", p.query)];
+            text.extend(found.iter().skip(p.first()).take(palette::ROWS).map(|i| palette::row_text(&i.label, i.hint, cols)));
+            if found.is_empty() { text.push("sin resultados".into()); }
+            let hi = if found.is_empty() { 0 } else { p.sel - p.first() + 1 };
+            (text.iter().map(|t| {
+                let mut b = Buffer::new(&mut g.fs, m);
+                b.set_size(None, Some(m.line_height));
+                b.set_text(t, &Attrs::new().family(Family::Name("Menlo")), Shaping::Advanced, None);
+                b.shape_until_scroll(&mut g.fs, false);
+                b
+            }).collect(), hi)
+        });
+        self.redraw();
+    }
+    fn close_palette(&mut self) {
+        self.pal = None;
+        self.show_palette();
+    }
+    fn palette_key(&mut self, el: &ActiveEventLoop, ev: &winit::event::KeyEvent) {
+        let Some(p) = self.pal.as_mut() else { return };
+        let n = p.found().len();
+        match &ev.logical_key {
+            Key::Named(NamedKey::Escape) => return self.close_palette(),
+            Key::Named(NamedKey::Enter) => { let c = p.picked(); self.close_palette(); if let Some(c) = c { self.run_cmd(el, c); } return; }
+            Key::Named(NamedKey::ArrowUp) => p.sel = sb::move_sel(p.sel, -1, n),
+            Key::Named(NamedKey::ArrowDown) => p.sel = sb::move_sel(p.sel, 1, n),
+            Key::Named(NamedKey::Backspace) => { p.query.pop(); p.sel = 0; }
+            _ => match &ev.text { Some(t) => { p.query.extend(t.chars().filter(|c| !c.is_control())); p.sel = 0; } None => return },
+        }
+        self.show_palette();
+    }
+    /// Clic con la paleta abierta: en una fila la ejecuta; fuera, la cierra.
+    fn palette_click(&mut self, el: &ActiveEventLoop) {
+        let (Some(g), Some(p)) = (self.g.as_ref(), self.pal.as_ref()) else { return };
+        let (x, y, w, rh) = palette::geom(g.w as f32, g.scale, g.bar_metrics().line_height);
+        let rows = g.pal.as_ref().map_or(0, |r| r.0.len());
+        if !inside((x, y, w, rh * rows as f32), self.mouse) { return self.close_palette(); }
+        let row = ((self.mouse.1 - y) / rh) as usize;
+        if row == 0 { return; }
+        let Some(c) = p.found().get(p.first() + row - 1).map(|i| i.cmd) else { return };
+        self.close_palette();
+        self.run_cmd(el, c);
+    }
+    fn run_cmd(&mut self, el: &ActiveEventLoop, c: palette::Cmd) {
+        use palette::Cmd;
+        (self.side.focus, self.side.col_focus, self.side.searching) = (false, false, false);
+        // Lo que actúa sobre la terminal cierra antes Agent usage, que la tapa.
+        if !matches!(c, Cmd::Usage) { self.uv.open = false; }
+        match c {
+            Cmd::Attention => self.go_attention(),
+            Cmd::Tab(i) => if i < self.tabs.len() { self.active_tab = i; },
+            Cmd::NewTab => self.new_tab(),
+            Cmd::OpenFolder => self.pick_folder(),
+            Cmd::Split => self.split(),
+            Cmd::ClosePane => { let (ti, pi) = (self.active_tab, self.tabs[self.active_tab].active); self.close_pane(el, ti, pi); }
+            Cmd::Search => { self.find = Some(String::new()); self.search(false, true); }
+            Cmd::Sidebar => self.toggle_side(),
+            Cmd::Agents => self.toggle_agents(),
+            Cmd::Processes => self.toggle_list(0),
+            Cmd::Ports => self.toggle_list(1),
+            Cmd::Usage => self.toggle_usage(),
+            Cmd::FontUp => self.set_font(Some(1.0)),
+            Cmd::FontDown => self.set_font(Some(-1.0)),
+            Cmd::FontReset => self.set_font(None),
+            Cmd::Launch(i) => self.launch(i),
+            Cmd::Restore(k) => self.restore_archived(k),
+        }
+        self.redraw();
+    }
     fn new_pane(&mut self, cmd: Option<Vec<String>>, cwd: Option<std::path::PathBuf>) -> Pane {
         let id = self.next_id;
         self.next_id += 1;
         let dir = cwd.as_ref().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
         let (p1, p2) = (self.proxy.clone(), self.proxy.clone());
         let session = Session::spawn(cmd, cwd, move || { let _ = p1.send_event(Ev::Out(id)); }, move || { let _ = p2.send_event(Ev::Exit(id)); });
-        let mut p = Pane { id, session, anchor: None, bufs: vec![], prev: vec![], chip_rect: None, cols: 0, rows: 0, rect: (0.0, 0.0, 1.0, 1.0), dy: 0.0, merged: None, gap: 0, cleared: false, asleep: false, last_busy: Instant::now(),
+        let mut p = Pane { id, session, anchor: None, bufs: vec![], done_rows: vec![], chip_rect: None, cols: 0, rows: 0, rect: (0.0, 0.0, 1.0, 1.0), dy: 0.0, merged: None, gap: 0, cleared: false, resized: false, working: None, asking: false, ctx: None, done: false, drawn: None, picked: None, asleep: false, last_busy: Instant::now(),
             born: Instant::now(), last_out: Instant::now(), unread: false, agent: sb::Agent::Shell, had_agent: false, project: "~".into(), token: None, dir, cwd: "~".into() };
         p.refresh();
         p
@@ -1304,17 +1853,37 @@ impl App {
     fn toggle_agents(&mut self) {
         let s = &mut self.side;
         (s.agents_open, s.agents_sel, s.stop_at, s.searching) = (!s.agents_open, 0, None, false);
-        s.col_focus = s.agents_open || s.procs_open;
+        s.col_focus = s.open_panels().contains(&true);
+        if s.agents_open { s.kf = 0; }
         self.sync_size(false);
         self.redraw();
     }
-    fn toggle_procs(&mut self) {
+    /// Abre o cierra Processes (`k` = 0) o Ports (`k` = 1); se apilan con Agents.
+    fn toggle_list(&mut self, k: usize) {
         let s = &mut self.side;
-        (s.procs_open, s.psel, s.pquery, s.pstop, s.pnope, s.searching) = (!s.procs_open, 0, String::new(), None, false, false);
-        s.mon.set(s.procs_open);
-        s.col_focus = s.agents_open || s.procs_open;
+        let open = !s.lists[k].open;
+        s.lists[k] = sb::List { open, ..Default::default() };
+        s.searching = false;
+        if open { s.kf = k + 1; }
+        s.mon.set(s.lists.iter().any(|l| l.open));
+        s.col_focus = s.open_panels().contains(&true);
         self.sync_size(false);
         self.redraw();
+    }
+    /// Termina el proceso confirmado, solo si sigue siendo el mismo y es nuestro.
+    fn stop_proc(&mut self, k: usize, (pid, name, ppid, uid): (i32, String, i32, u32)) {
+        let mut snap = self.side.mon.snap.lock().unwrap();
+        if !procs::same_proc(&snap.procs, pid, &name, ppid, uid) { self.side.lists[k].changed = true; return; }
+        // SAFETY: getuid/getpid/getppid no tocan memoria; kill con SIGTERM (15), nunca SIGKILL.
+        if unsafe { procs::can_stop(uid, getuid(), pid, getpid(), getppid()) && kill(pid, 15) == 0 } {
+            // Sale ya de la lista; si ignora la señal, vuelve en la siguiente lectura.
+            snap.listen.retain(|l| l.1 != pid);
+        } else { self.side.lists[k].nope = true; }
+    }
+    /// Pide confirmación para terminar el proceso de la fila.
+    fn arm_stop(&mut self, k: usize, r: &procs::Row) {
+        // SAFETY: llamadas libc sin punteros.
+        if unsafe { procs::can_stop(r.uid, getuid(), r.pid, getpid(), getppid()) } { self.side.lists[k].stop = Some((r.pid, r.name.clone(), r.ppid, r.uid)); } else { self.side.lists[k].nope = true; }
     }
     /// Abre o cierra Agent usage; al abrir relee el historial en segundo plano (si tiene más de 60 s).
     fn toggle_usage(&mut self) {
@@ -1323,11 +1892,11 @@ impl App {
         self.redraw();
     }
     fn close_agents(&mut self) { self.side.agents_open = false; self.sync_size(false); }
-    fn close_procs(&mut self) { self.side.procs_open = false; self.side.mon.set(false); self.sync_size(false); }
+    fn close_list(&mut self, k: usize) { self.side.lists[k].open = false; self.side.mon.set(self.side.lists.iter().any(|l| l.open)); self.sync_size(false); }
     /// Rects (px) de Agents y Processes en la columna derecha.
-    fn column(&self) -> (Option<R>, Option<R>) {
+    fn column(&self) -> [Option<R>; 3] {
         let g = self.g.as_ref().unwrap();
-        sb::column((g.w as f32, g.h as f32), g.scale, TABBAR_H * g.scale, self.side.agents_open, self.side.procs_open)
+        sb::column((g.w as f32, g.h as f32), g.scale, TABBAR_H * g.scale, self.side.open_panels())
     }
     /// Enfoca el panel de la app cuyo pty es el proceso (o un ancestro suyo); si no hay, nada.
     fn go_proc(&mut self, pid: i32) {
@@ -1338,31 +1907,27 @@ impl App {
         if let Some((ti, pi)) = hit { self.side.focus = false; self.active_tab = ti; self.tabs[ti].active = pi; }
     }
     /// Teclas del panel Processes (abierto y visible): consume todo para que nada llegue al PTY.
-    fn procs_key(&mut self, ev: &winit::event::KeyEvent) {
-        let rows = { let s = self.side.mon.snap.lock().unwrap(); procs::rows(&s.procs, &s.ports, self.side.psort, &self.side.pquery) };
-        let sel = self.side.psel.min(rows.len().saturating_sub(1));
-        let pending = self.side.pstop.take();
-        (self.side.pnope, self.side.pchanged) = (false, false);
+    fn procs_key(&mut self, k: usize, ev: &winit::event::KeyEvent) {
+        let rows = proc_rows(&self.side, k);
+        let sel = self.side.lists[k].sel.min(rows.len().saturating_sub(1));
+        let pending = self.side.lists[k].stop.take();
+        (self.side.lists[k].nope, self.side.lists[k].changed) = (false, false);
         match ev.logical_key.as_ref() {
-            Key::Named(NamedKey::ArrowUp) => self.side.psel = sb::move_sel(sel, -1, rows.len()),
-            Key::Named(NamedKey::ArrowDown) => self.side.psel = sb::move_sel(sel, 1, rows.len()),
+            Key::Named(NamedKey::ArrowUp) => self.side.lists[k].sel = sb::move_sel(sel, -1, rows.len()),
+            Key::Named(NamedKey::ArrowDown) => self.side.lists[k].sel = sb::move_sel(sel, 1, rows.len()),
+            Key::Named(NamedKey::Tab) if k == 1 => if let Some(r) = rows.get(sel) { self.go_proc(r.pid); },
             Key::Named(NamedKey::Tab) => self.side.psort = if self.side.psort == procs::Sort::Cpu { procs::Sort::Mem } else { procs::Sort::Cpu },
-            Key::Named(NamedKey::Escape) => if pending.is_none() { self.close_procs() },
+            Key::Named(NamedKey::Escape) => if pending.is_none() { self.close_list(k) },
             Key::Named(NamedKey::Enter) => match pending {
-                // SAFETY: getuid/getpid/getppid no tocan memoria; kill con SIGTERM (15), nunca SIGKILL.
-                Some((pid, name, ppid, uid)) => {
-                    let ok = procs::same_proc(&self.side.mon.snap.lock().unwrap().procs, pid, &name, ppid, uid);
-                    if !ok { self.side.pchanged = true; }
-                    else if unsafe { procs::can_stop(uid, getuid(), pid, getpid(), getppid()) } { unsafe { kill(pid, 15); } } else { self.side.pnope = true; }
+                Some(p) => self.stop_proc(k, p),
+                None => if let Some(r) = rows.get(sel) {
+                    if k == 1 { let _ = Command::new("open").arg(local_url(r)).spawn(); } else { self.go_proc(r.pid); }
                 },
-                None => if let Some(r) = rows.get(sel) { self.go_proc(r.pid); },
             },
-            Key::Named(NamedKey::Backspace) if self.mods.super_key() => if let Some(r) = rows.get(sel) {
-                // SAFETY: llamadas libc sin punteros.
-                if unsafe { procs::can_stop(r.uid, getuid(), r.pid, getpid(), getppid()) } { self.side.pstop = Some((r.pid, r.name.clone(), r.ppid, r.uid)); } else { self.side.pnope = true; }
-            },
-            Key::Named(NamedKey::Backspace) => { self.side.pquery.pop(); self.side.psel = 0; }
-            _ => if let Some(t) = &ev.text { self.side.pquery.extend(t.chars().filter(|c| !c.is_control())); self.side.psel = 0; },
+            Key::Named(NamedKey::Backspace) if self.mods.super_key() => if let Some(r) = rows.get(sel) { self.arm_stop(k, r); },
+            Key::Character("c") if self.mods.super_key() => if let Some(r) = rows.get(sel) { pbcopy(&local_url(r)); },
+            Key::Named(NamedKey::Backspace) => { self.side.lists[k].query.pop(); self.side.lists[k].sel = 0; }
+            _ => if let Some(t) = &ev.text { self.side.lists[k].query.extend(t.chars().filter(|c| !c.is_control())); self.side.lists[k].sel = 0; },
         }
         self.redraw();
     }
@@ -1390,8 +1955,9 @@ impl App {
         let (m, sc) = (self.mouse, self.g.as_ref().unwrap().scale);
         self.side.col_focus = true;
         self.side.focus = false;
-        let (ra, rp) = self.column();
-        if let Some(r) = ra.filter(|r| inside(*r, m)) {
+        let cols = self.column();
+        if let Some(k) = cols.iter().position(|r| r.is_some_and(|r| inside(r, m))) { self.side.kf = k; }
+        if let Some(r) = cols[0].filter(|r| inside(*r, m)) {
             let rows = sb::agent_rows(entries(&self.tabs, self.active_tab));
             if inside(usage_btn(r, sc), m) { self.toggle_usage(); return; }
             match sb::ahit_at(&sb::agents_layout(r, sc, rows.len()), m) {
@@ -1399,11 +1965,20 @@ impl App {
                 Some(sb::AHit::Row(i)) => { self.side.agents_sel = i; self.go_agent(&rows[i]); }
                 None => {}
             }
-        } else if let Some(r) = rp.filter(|r| inside(*r, m)) {
-            let n = { let s = self.side.mon.snap.lock().unwrap(); procs::rows(&s.procs, &s.ports, self.side.psort, &self.side.pquery) };
+        } else if let Some((k, r)) = (0..2).find_map(|k| Some((k, cols[k + 1].filter(|r| inside(*r, m))?))) {
+            let n = proc_rows(&self.side, k);
+            let pending = self.side.lists[k].stop.take();
+            (self.side.lists[k].nope, self.side.lists[k].changed) = (false, false);
             match sb::ahit_at(&sb::procs_layout(r, sc, n.len()), m) {
-                Some(sb::AHit::Close) => self.close_procs(),
-                Some(sb::AHit::Row(i)) => { self.side.psel = i; self.go_proc(n[i].pid); }
+                Some(sb::AHit::Close) => self.close_list(k),
+                Some(sb::AHit::Row(i)) => {
+                    self.side.lists[k].sel = i;
+                    if k == 0 { self.go_proc(n[i].pid); }
+                    // En Ports, la × de la fila pide confirmación y un segundo clic termina; el resto abre en el navegador.
+                    else if m.0 >= r.0 + r.2 - 48.0 * sc {
+                        match pending.filter(|p| p.0 == n[i].pid) { Some(p) => self.stop_proc(k, p), None => self.arm_stop(k, &n[i]) }
+                    } else { let _ = Command::new("open").arg(local_url(&n[i])).spawn(); }
+                }
                 None => {}
             }
         }
@@ -1511,7 +2086,7 @@ impl App {
     /// Abre o cierra la vista previa según lo que haya bajo el ratón; solo mira al cambiar de celda.
     fn hover_peek(&mut self) {
         let m = self.mouse;
-        let over = !self.uv.open && self.pane().anchor.is_none() && !self.mouse_fwd && self.pane().has(m.0, m.1);
+        let over = !self.uv.open && self.pal.is_none() && self.pane().anchor.is_none() && !self.mouse_fwd && self.pane().has(m.0, m.1);
         if !over { self.peek.close(); return; }
         let at = (self.pane().id, self.cell());
         if self.peek.at == Some(at) { return; }
@@ -1523,6 +2098,42 @@ impl App {
         match file.filter(|f| previewable(f)) { Some(f) => self.peek.show(f), None => self.peek.hide() }
         if changed { self.redraw(); }
     }
+    /// Semáforo: quién pide respuesta y quién terminó. Avisa de los que no estás mirando.
+    fn update_lights(&mut self) {
+        let now = Instant::now();
+        let mut changed = false;
+        for (ti, t) in self.tabs.iter_mut().enumerate() {
+            for (pi, p) in t.panes.iter_mut().enumerate() {
+                let title = p.session.title.lock().unwrap().clone();
+                let rows = if p.agent == sb::Agent::Shell { vec![] } else { live_rows(&p.session.term.lock().unwrap()) };
+                let ctx = if p.agent == sb::Agent::Claude { rows.iter().rev().find_map(|r| ctx_of(r)).map(|c| c.0).or(p.ctx) } else { None };
+                changed |= ctx != p.ctx;
+                p.ctx = ctx;
+                // Claude lo dice él mismo; para los demás (o si no lo dice) se deduce de la pantalla y el título.
+                let said = (p.agent == sb::Agent::Claude).then(|| p.session.fg_pid().and_then(claude_status)).flatten();
+                let (asking, working) = said.unwrap_or_else(|| {
+                    let asking = sb::asking(&rows);
+                    (asking, !asking && (sb::interruptible(&rows) || sb::status(p.agent, p.had_agent, now - p.last_out, &title) == sb::Status::Working))
+                });
+                let watching = self.focused && ti == self.active_tab && pi == t.active;
+                let was = (p.asking, p.done, p.working.is_some());
+                let who = p.agent.name().unwrap_or("El agente");
+                if asking {
+                    // Preguntar no es terminar: se olvida desde cuándo trabajaba.
+                    p.working = None;
+                    if !p.asking && !watching { notify("Ónix", &format!("{who} necesita tu respuesta en {}", p.project)); }
+                // shortcut: el estado de los agentes sin título animado sale de si escriben; una pausa larga también avisa.
+                } else if finished(&mut p.working, working, now) && !watching {
+                    p.done = true;
+                    notify("Ónix", &format!("{who} terminó en {}", p.project));
+                }
+                p.asking = asking;
+                p.done &= !watching && !working && !asking;
+                changed |= was != (p.asking, p.done, p.working.is_some());
+            }
+        }
+        if changed { self.redraw(); }
+    }
     /// Cierra los Claude de pestañas ocultas que llevan rato esperando; la pestaña queda lista para retomarlos.
     fn sleep_idle(&mut self) {
         let after = std::env::var("MI_TERMINAL_SLEEP_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(SLEEP_AFTER);
@@ -1530,9 +2141,9 @@ impl App {
         for ti in 0..self.tabs.len() {
             for pi in 0..self.tabs[ti].panes.len() {
                 let p = &mut self.tabs[ti].panes[pi];
-                if p.asleep || p.agent != sb::Agent::Claude { continue; }
+                if p.asleep || p.asking || p.agent != sb::Agent::Claude { continue; }
                 let title = p.session.title.lock().unwrap().clone();
-                if ti == self.active_tab || sb::status(p.agent, p.had_agent, now - p.last_out, &title) == sb::Status::Working { p.last_busy = now; continue; }
+                if ti == self.active_tab || p.working.is_some() || sb::status(p.agent, p.had_agent, now - p.last_out, &title) == sb::Status::Working { p.last_busy = now; continue; }
                 if after == 0 || (now - p.last_busy).as_secs() < after { continue; }
                 p.refresh();
                 let (Some(pid), Some(id)) = (p.session.fg_pid(), p.token.clone()) else { continue };
@@ -1553,7 +2164,8 @@ impl App {
                 session.resize(p.cols.max(2), p.rows.max(2));
                 p.session = session;
                 (p.id, p.asleep, p.agent, p.had_agent, p.anchor) = (new, true, sb::Agent::Shell, false, None);
-                p.prev.iter_mut().for_each(|r| *r = None);
+                p.done_rows.iter_mut().for_each(|r| *r = None);
+                p.drawn = None;
                 self.redraw();
             }
         }
@@ -1649,6 +2261,7 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 // Sin repintados hace rato: se suelta la superficie que no se ve (~23 MB a pantalla completa).
                 if let Some(g) = &mut self.g { g.screen.release_idle(); }
                 if self.ticks % 30 == 0 { self.sleep_idle(); }
+                self.update_lights();
                 // Autoguardado: si la app se cae, las pestañas siguen ahí.
                 if self.ticks % 5 == 0 { self.save_tabs(); if let Some(g) = &self.g { save_window(&g.window); } }
                 // Agentes instalados después de abrir la app: se vuelve a mirar cada 10 ticks.
@@ -1690,12 +2303,13 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 g.h = z.height.max(1);
                 g.screen.resize(g.w as usize, g.h as usize, g.window.scale_factor());
                 self.sync_size(true);
+                if self.pal.is_some() { self.show_palette(); }
                 self.redraw();
             }
             // Ventana tapada o minimizada: se sueltan las superficies y se rehacen al volver.
             WindowEvent::Occluded(hidden) => {
                 self.hidden = hidden;
-                self.side.mon.set(self.side.procs_open && !hidden);
+                self.side.mon.set(self.side.lists.iter().any(|l| l.open) && !hidden);
                 if hidden { self.peek.close(); }
                 if hidden { self.g.as_mut().unwrap().screen.release_all(); } else { self.redraw(); }
             }
@@ -1706,6 +2320,7 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 let t = &mut self.tabs[self.active_tab];
                 let a = t.active;
                 t.panes[a].unread = false;
+                if self.focused { t.panes[a].done = false; }
                 let (hi, bh) = (bar_hit(self.mouse, self.tabs.len(), g_w(self.g.as_ref().unwrap()), self.g.as_ref().unwrap().scale, bar_left(self.side.visible, self.g.as_ref().unwrap().scale)), self.mq);
                 // Reinicia el reloj al cambiar de pestaña bajo el ratón.
                 let hi = match hi { Some(BarHit::Tab(i) | BarHit::Close(i)) => Some(i), _ => None };
@@ -1714,16 +2329,15 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 // Redibujo continuo solo mientras el carrusel está activo (hover sobre título largo).
                 let ovl = if self.uv.open {
                     let (a, sc, m, range) = (self.area(), self.g.as_ref().unwrap().scale, self.mouse, self.uv.range);
-                    let (rs, tx) = usage_view::build(a, sc, self.uv.stats(), range, m);
-                    Some((a, rs, tx))
+                    let (rs, tx, lo) = usage_view::build(a, sc, self.uv.stats(), range, m);
+                    Some((a, rs, tx, lo))
                 } else { None };
+                let t0 = Instant::now();
                 let animating = draw(self.g.as_mut().unwrap(), &mut self.tabs, self.active_tab, self.mouse, &self.side, mt, ovl, self.peek.link.as_ref());
-                // Sin esto se redibujaba a la frecuencia de la pantalla. Carrusel (ratón sobre barra o lateral): ~30 fps; spinner: 10.
+                if debug_on() { eprintln!("[mt] cuadro {:.3} ms", t0.elapsed().as_secs_f64() * 1000.0); }
+                // Sin esto se redibujaba a la frecuencia de la pantalla. Carrusel y onda de puntos: ~30 fps.
                 self.next_frame = animating.then(|| {
-                    let sc = self.g.as_ref().unwrap().scale;
-                    let (x, y) = self.mouse;
-                    let hover = (x >= 0.0 && y >= 0.0) && (y < TABBAR_H * sc || (self.side.visible && x < sb::SIDE_W * sc));
-                    Instant::now() + std::time::Duration::from_millis(if hover { 33 } else { 100 })
+                    Instant::now() + std::time::Duration::from_millis(33)
                 });
                 if self.g.as_ref().unwrap().busy { self.next_frame = Some(Instant::now() + std::time::Duration::from_millis(4)); }
             }
@@ -1741,17 +2355,53 @@ impl winit::application::ApplicationHandler<Ev> for App {
                     self.redraw();
                     return;
                 }
-                if self.side.col_focus && self.side.procs_open && !ctrl && (!cmd || event.logical_key == Key::Named(NamedKey::Backspace)) { self.procs_key(&event); return; }
-                if !cmd && !ctrl && self.side.col_focus && self.side.agents_open && !self.side.searching { self.agents_key(&event); return; }
+                if cmd && event.logical_key.as_ref() == Key::Character("k") {
+                    if self.pal.is_some() { self.close_palette(); } else { self.open_palette(); }
+                    return;
+                }
+                if self.pal.is_some() {
+                    if !cmd && !ctrl { self.palette_key(el, &event); return; }
+                    // Cualquier otro atajo la cierra y sigue su camino.
+                    if !matches!(event.logical_key, Key::Named(NamedKey::Super | NamedKey::Shift | NamedKey::Control)) { self.close_palette(); }
+                }
+                if cmd && event.logical_key.as_ref() == Key::Character("f") {
+                    if self.find.is_some() { self.close_find(); } else { self.find = Some(String::new()); self.search(false, true); }
+                    return;
+                }
+                if self.find.is_some() {
+                    if !cmd && !ctrl { self.find_key(&event); return; }
+                    // Cualquier otro atajo (salvo copiar lo hallado) cierra la búsqueda.
+                    if cmd && event.logical_key.as_ref() != Key::Character("c") && !matches!(event.logical_key, Key::Named(NamedKey::Super | NamedKey::Shift)) { self.close_find(); }
+                }
+                // El teclado va al panel de la columna con foco; con ⌘ solo se queda ⌘⌫ (y ⌘C en Ports).
+                if let Some(k) = (0..2).find(|&k| self.side.col_focus && self.side.kf == k + 1 && self.side.lists[k].open) {
+                    let own = !cmd || event.logical_key == Key::Named(NamedKey::Backspace) || (k == 1 && event.logical_key.as_ref() == Key::Character("c"));
+                    if !ctrl && own { self.procs_key(k, &event); return; }
+                }
+                if !cmd && !ctrl && self.side.col_focus && self.side.kf == 0 && self.side.agents_open && !self.side.searching { self.agents_key(&event); return; }
                 if !cmd && !ctrl && self.side_key(&event) { return; }
                 if cmd {
                     match event.logical_key.as_ref() {
                         Key::Character("b" | "\\") => self.toggle_side(),
                         Key::Character("a" | "A") if self.mods.shift_key() => self.toggle_agents(),
-                        Key::Character("p" | "P") if self.mods.shift_key() => self.toggle_procs(),
+                        Key::Character("p" | "P") if self.mods.shift_key() => self.toggle_list(0),
+                        Key::Character("l" | "L") if self.mods.shift_key() => self.toggle_list(1),
                         Key::Character("c") => {
-                            if let Some(s) = self.pane().session.term.lock().unwrap().selection_to_string() { pbcopy(&s); }
+                            if let Some(s) = selected_text(&self.pane().session.term.lock().unwrap()) { pbcopy(&s); }
                         }
+                        Key::Character("a") => {
+                            let p = self.pane();
+                            let mut t = p.session.term.lock().unwrap();
+                            select_input(&mut t);
+                            p.picked = span(&t);
+                            drop(t);
+                            self.redraw();
+                        }
+                        // Ctrl+_ es "deshacer" en zsh y en Claude Code: quita de una vez lo recién pegado.
+                        Key::Character("z") => self.send_input(&[0x1f]),
+                        Key::Character("=" | "+") => self.set_font(Some(1.0)),
+                        Key::Character("-") => self.set_font(Some(-1.0)),
+                        Key::Character("0") => self.set_font(None),
                         Key::Character("v") => {
                             // Portapapeles sin texto: si es una imagen, se guarda y se pega su ruta.
                             let mut t = pbpaste();
@@ -1766,17 +2416,8 @@ impl winit::application::ApplicationHandler<Ev> for App {
                         Key::Character("t" | "T") => self.new_tab(),
                         Key::Character("o" | "O") if self.mods.shift_key() => self.pick_folder(),
                         Key::Character("w") => { let (ti, pi) = (self.active_tab, self.tabs[self.active_tab].active); self.close_pane(el, ti, pi); }
-                        Key::Character("d") => {
-                            if self.tabs[self.active_tab].panes.len() < 2 {
-                                let p = self.new_pane(None, None);
-                                let t = &mut self.tabs[self.active_tab];
-                                t.panes.push(p);
-                                t.active = 1;
-                                t.split = 0.5;
-                                self.sync_size(false);
-                                self.redraw();
-                            }
-                        }
+                        Key::Character("d") => self.split(),
+                        Key::Character("j") => self.go_attention(),
                         Key::Character("[" | "]") => {
                             let t = &mut self.tabs[self.active_tab];
                             if t.panes.len() == 2 { t.active = 1 - t.active; self.redraw(); }
@@ -1788,6 +2429,17 @@ impl winit::application::ApplicationHandler<Ev> for App {
                         _ => {}
                     }
                     return;
+                }
+                // Borrar justo tras ⌘A quita todo lo escrito, no solo un carácter.
+                if matches!(event.logical_key, Key::Named(NamedKey::Backspace | NamedKey::Delete)) {
+                    let p = self.pane();
+                    let picked = p.picked.take();
+                    let all = {
+                        let t = p.session.term.lock().unwrap();
+                        selected_text(&t).filter(|_| picked.is_some() && span(&t) == picked)
+                            .map(|s| erase_bytes(s.chars().count(), t.mode().contains(TermMode::APP_CURSOR)))
+                    };
+                    if let Some(b) = all { self.send_input(&b); return; }
                 }
                 let m = Mods { shift: self.mods.shift_key(), alt: self.mods.alt_key(), ctrl };
                 // Shift+RePág/AvPág: historial local (no llega al shell), como las demás terminales.
@@ -1826,6 +2478,7 @@ impl winit::application::ApplicationHandler<Ev> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.peek.close();
+                if self.pal.is_some() { return; }
                 let ch = self.g.as_ref().unwrap().cell.1;
                 let lines = take_lines(&mut self.scroll_acc, match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
@@ -1846,7 +2499,8 @@ impl winit::application::ApplicationHandler<Ev> for App {
             }
             // Sin esto el carrusel seguiría girando con el ratón fuera de la ventana.
             WindowEvent::CursorLeft { .. } => { self.mouse = (-1.0, -1.0); self.peek.close(); self.redraw(); }
-            WindowEvent::Focused(false) => self.peek.close(),
+            WindowEvent::Focused(false) => { self.focused = false; self.peek.close(); }
+            WindowEvent::Focused(true) => self.focused = true,
             WindowEvent::CursorMoved { position, .. } => {
                 let bar_h = TABBAR_H * self.g.as_ref().unwrap().scale;
                 let was_bar = self.mouse.1 < bar_h;
@@ -1885,9 +2539,10 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 self.peek.close();
                 if state == ElementState::Released {
                     self.drag_sep = false;
+                    // El soltar del clic que usó la paleta no es de la terminal.
+                    if self.pal.is_some() { return; }
                     let on_side = self.side.visible && self.mouse.0 < sb::SIDE_W * self.g.as_ref().unwrap().scale;
-                    let (ra, rp) = self.column();
-                    if on_side || ra.is_some_and(|r| inside(r, self.mouse)) || rp.is_some_and(|r| inside(r, self.mouse)) { return; }
+                    if on_side || self.column().iter().any(|r| r.is_some_and(|r| inside(r, self.mouse))) { return; }
                     if self.uv.open && inside(self.area(), self.mouse) { return; }
                     let a = self.pane().anchor.take();
                     let (cell, off) = (self.cell(), self.pane().session.term.lock().unwrap().grid().display_offset());
@@ -1921,13 +2576,14 @@ impl winit::application::ApplicationHandler<Ev> for App {
                     self.redraw();
                     return;
                 }
+                if self.pal.is_some() { self.palette_click(el); return; }
                 let sc = self.g.as_ref().unwrap().scale;
                 if inside((BAR_LEFT * sc, 0.0, 28.0 * sc, TABBAR_H * sc), self.mouse) { self.toggle_side(); return; }
                 let wpx = self.g.as_ref().unwrap().w as f32;
-                if inside(bar_btn(wpx, sc, BTN_PULSE), self.mouse) { self.toggle_procs(); return; }
+                if inside(bar_btn(wpx, sc, BTN_PULSE), self.mouse) { self.toggle_list(0); return; }
                 if inside(bar_btn(wpx, sc, BTN_ROBOT), self.mouse) { self.toggle_agents(); return; }
-                if inside(bar_btn(wpx, sc, BTN_GLOBE), self.mouse) { return; }
-                { let (ra, rp) = self.column(); if ra.is_some_and(|r| inside(r, self.mouse)) || rp.is_some_and(|r| inside(r, self.mouse)) { self.col_click(); return; } }
+                if inside(bar_btn(wpx, sc, BTN_GLOBE), self.mouse) { self.toggle_list(1); return; }
+                { if self.column().iter().any(|r| r.is_some_and(|r| inside(r, self.mouse))) { self.col_click(); return; } }
                 if self.uv.open && inside(self.area(), self.mouse) {
                     match usage_view::hit_at(self.area(), sc, self.mouse) {
                         Some(usage_view::Hit::Close) => self.toggle_usage(),
@@ -2147,9 +2803,9 @@ fn main() {
     el.set_control_flow(ControlFlow::Wait);
     let tick = el.create_proxy();
     std::thread::spawn(move || while tick.send_event(Ev::Tick).is_ok() { std::thread::sleep(std::time::Duration::from_secs(1)); });
-    let side = sb::Side { col_focus: false, procs_open: false, psel: 0, psort: procs::Sort::Cpu, pquery: String::new(), pstop: None, pnope: false, pchanged: false, mon: procs::Mon::start(), agents_open: false, agents_sel: 0, stop_at: None, visible: true, focus: false, searching: false, query: String::new(), filter: sb::Filter::All,
+    let side = sb::Side { col_focus: false, lists: Default::default(), kf: 0, psort: procs::Sort::Cpu, mon: procs::Mon::start(), agents_open: false, agents_sel: 0, stop_at: None, visible: true, focus: false, searching: false, query: String::new(), filter: sb::Filter::All,
         archived: data_file("archived.json").and_then(|f| std::fs::read_to_string(f).ok()).map(|t| sb::archived_from_json(&t)).unwrap_or_default(), open_archived: false, installed: sb::LAUNCH.map(|(_, b)| sb::on_path(b)) };
-    let mut app = App { uv: usage_view::View::new(), g: None, tabs: vec![], active_tab: 0, next_id: 0, proxy: el.create_proxy(), last_bar_click: None, last_sep_click: None, ticks: 0, restore: None, picking: false, mq: (None, Instant::now()),
+    let mut app = App { uv: usage_view::View::new(), g: None, tabs: vec![], active_tab: 0, next_id: 0, proxy: el.create_proxy(), last_bar_click: None, last_sep_click: None, ticks: 0, restore: None, picking: false, focused: true, find: None, pal: None, mq: (None, Instant::now()),
         mods: ModifiersState::empty(), mouse: (0.0, 0.0), scroll_acc: 0.0, drag_sep: false, mouse_fwd: false, hidden: false, last_draw: Instant::now(), last_input: Instant::now(), next_frame: None, peek: Peek::default(), side };
     // Reabre las pestañas guardadas (cwd existente); sin archivo, o con MI_TERMINAL_CMD, una pestaña en HOME.
     let saved = data_file("tabs.txt")
@@ -2172,25 +2828,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn sube_el_contexto_encima_de_la_raya() {
+    fn el_punto_late() {
+        assert_eq!(super::pulse([200, 100, 0], 0.0), [200, 100, 0]);
+        assert_eq!(super::pulse([200, 100, 0], 0.6), [50, 25, 0]);
+    }
+    #[test]
+    fn estado_que_dice_claude() {
+        assert_eq!(super::claude_state(r#"{"status":"busy"}"#), Some((false, true)));
+        assert_eq!(super::claude_state(r#"{"status":"waiting","waitingFor":"input needed"}"#), Some((true, false)));
+        assert_eq!(super::claude_state(r#"{"status":"idle"}"#), Some((false, false)));
+        assert_eq!(super::claude_state(r#"{"pid":1}"#), None);
+    }
+    #[test]
+    fn pie_cuadro_y_esquinas() {
         let mk = |t: &str| -> Vec<(usize, usize, char, u8, u8, bool)> { format!("{t:<30}").chars().enumerate().map(|(i, c)| (i, 1, c, 0, 0, false)).collect() };
         let txt = |r: &[(usize, usize, char, u8, u8, bool)]| r.iter().map(|c| c.2).collect::<String>().trim_end().to_string();
-        let line = "─".repeat(30);
         let col = [1, 2, 3, 4, 5];
-        let mut g = vec![mk(""), mk(&line), mk("❯ hola"), mk(&line), mk("  ctx 29%   5h 8%")];
-        lift_context(&mut g, col);
-        assert_eq!(txt(&g[0]), "     contexto ━━━─────── 29%");
-        assert_eq!((txt(&g[1]), txt(&g[4])), (line.clone(), "  5h 8%".into()));
-        assert_eq!((g[0][14].3, g[0][20].3, g[0][25].3), (3, 2, 3));
-        // Fila de arriba ocupada: va sobre la raya. Desde 80 %, color de aviso.
-        let mut o = vec![mk(&"x".repeat(30)), mk(&line), mk("❯"), mk(&line), mk("  ctx 85%")];
-        lift_context(&mut o, col);
-        assert_eq!(txt(&o[1]), "──── contexto ━━━━━━━━━─ 85% ─");
-        assert_eq!(o[1][14].3, 5);
-        // Sin las dos rayas no se toca.
-        let mut n = vec![mk(&line), mk("  ctx 25%   5h 8%")];
-        lift_context(&mut n, col);
-        assert_eq!(txt(&n[1]), "  ctx 25%   5h 8%");
+        let mut g = vec![mk("  ctx 29% 5h 8%")];
+        super::ctx_bar(&mut g, col);
+        assert_eq!(txt(&g[0]), "  contexto ━━━───── 29% 5h 8%");
+        // Sin sitio para la barra queda la cifra.
+        let mut n = vec![mk("  ctx 85%   5h 8% sem 3%")];
+        super::ctx_bar(&mut n, col);
+        assert!(txt(&n[0]).starts_with("  contexto 85%   5h"));
+        let line = "─".repeat(30);
+        let b = vec![mk(&line), mk("❯ hola"), mk(&line), mk("  ▸▸ auto mode on")];
+        assert_eq!(super::input_box(&b, 30), Some((0, 2)));
+        assert_eq!(super::input_box(&b[1..], 30), None);
+        assert_eq!(super::footer_row(&txt(&b[3])), Some(false));
+        assert_eq!(super::footer_row("  contexto 3%"), Some(true));
+        assert_eq!(super::footer_row("el modo mode on"), None);
+        let mut out = vec![];
+        super::round(&mut out, (0.0, 0.0, 20.0, 20.0), 6.0, [9, 9, 9], [0, 0, 0], true);
+        assert!(out.iter().all(|r| r.0 >= 0.0 && r.1 >= 0.0 && r.0 + r.2 <= 20.0 && r.1 + r.3 <= 20.0));
     }
     #[test]
     fn lee_la_ventana_guardada() {
@@ -2236,9 +2906,70 @@ mod tests {
         p.advance(&mut t, "1\r\n2\r\n3\r\n4\r\n5\r\n❯ /clear\r\n7".as_bytes());
         super::forget_on_clear(&mut t);
         assert!(t.grid().history_size() > 0); // sin la cabecera no se toca
-        p.advance(&mut t, "\x1b[H\x1b[J ▐ Claude Code v2\r\n\r\n❯ /clear".as_bytes());
+        p.advance(&mut t, "\x1b[H\x1b[J$ claude\r\n ▐ Claude Code v2\r\n\r\n❯ /clear\r\nfin".as_bytes());
         super::forget_on_clear(&mut t);
         assert_eq!(t.grid().history_size(), 0);
+        // La cabecera queda arriba y el cursor sigue sobre su texto.
+        assert_eq!(t.grid()[super::Line(0)][super::Column(3)].c, 'C');
+        assert_eq!(t.grid().cursor.point.line.0, 3);
+    }
+    #[test]
+    fn al_cambiar_el_ancho_no_queda_copia_vieja() {
+        use term_core::alacritty_terminal::{event::VoidListener, grid::Dimensions, term::Config, vte::ansi::Processor};
+        let mut t = super::Term::new(Config::default(), &term_core::Size(30, 5), VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, " ▐ Claude Code v2\r\n\r\n❯ una pregunta bastante larga\r\n\r\nrespuesta".as_bytes());
+        t.resize(term_core::Size(20, 5));
+        assert!(t.grid().history_size() > 0);
+        let mut resized = true;
+        // Charla larga: sin cabecera arriba, el historial se conserva.
+        p.advance(&mut t, b"\x1b[H\x1b[2Kfinal");
+        super::forget_after_resize(&mut t, &mut resized);
+        assert!(t.grid().history_size() > 0 && resized);
+        p.advance(&mut t, "\x1b[H\x1b[2K ▐ Claude Code v2".as_bytes());
+        super::forget_after_resize(&mut t, &mut resized);
+        assert!(t.grid().history_size() == 0 && !resized);
+    }
+    #[test]
+    fn cmd_a_selecciona_solo_lo_escrito() {
+        use term_core::alacritty_terminal::{event::VoidListener, term::Config, vte::ansi::Processor};
+        let mut t = super::Term::new(Config::default(), &term_core::Size(20, 8), VoidListener);
+        let mut p: Processor = Processor::new();
+        let mut pick = |t: &mut super::Term<VoidListener>, bytes: &str| { p.advance(t, bytes.as_bytes()); super::select_input(t); super::selected_text(t) };
+        // Cuadro de Claude Code con dos líneas: ni el chat ni el pie.
+        let claude = "chat\r\n──────\r\n❯ hola\r\n  mundo\r\n──────\r\npie\x1b[4;8H";
+        assert_eq!(pick(&mut t, claude).as_deref(), Some("hola\nmundo"));
+        assert!(super::span(&t).is_some());
+        let b = super::erase_bytes(2, false);
+        assert!(b.starts_with(b"\x1b[C") && b.iter().filter(|&&c| c == 0x7f).count() == 20);
+        // Línea del shell partida por el ancho.
+        assert_eq!(pick(&mut t, "\x1b[H\x1b[2J~\r\n❯ echo abcdefghijklmnopqrst").as_deref(), Some("echo abcdefghijklmnopqrst"));
+        // Sugerencia atenuada, o salida sin prompt junto al cursor: nada.
+        assert_eq!(pick(&mut t, "\x1b[H\x1b[2J❯ \x1b[2mTry\x1b[0m"), None);
+        assert_eq!(pick(&mut t, "\x1b[H\x1b[2J❯ ls\r\nsalida"), None);
+    }
+    #[test]
+    fn avisa_solo_tras_trabajar_un_rato() {
+        let (t0, mut s) = (std::time::Instant::now(), None);
+        let at = |n| t0 + std::time::Duration::from_secs(n);
+        assert!(!super::finished(&mut s, false, at(0)));
+        assert!(!super::finished(&mut s, true, at(1)) && !super::finished(&mut s, false, at(5))); // muy corto
+        assert!(!super::finished(&mut s, true, at(10)) && !super::finished(&mut s, true, at(30)));
+        assert!(super::finished(&mut s, false, at(31)) && !super::finished(&mut s, false, at(32))); // una sola vez
+    }
+    #[test]
+    fn busca_en_el_historial() {
+        use term_core::alacritty_terminal::{event::VoidListener, term::Config, vte::ansi::Processor};
+        let mut t = super::Term::new(Config::default(), &term_core::Size(20, 3), VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"Error uno\r\nbien\r\notro error\r\nfin");
+        let last = super::find_match(&t, "ERROR", None, true).unwrap();
+        assert_eq!((last.0.line.0, last.0.column.0, last.1.column.0), (1, 5, 9));
+        let prev = super::find_match(&t, "error", Some(last.0), true).unwrap();
+        assert_eq!(prev.0.line.0, -1); // en el historial
+        assert_eq!(super::find_match(&t, "error", Some(prev.0), true), Some(last)); // da la vuelta
+        assert_eq!(super::find_match(&t, "nada", None, true), None);
+        assert_eq!((super::parse_font("16\n"), super::parse_font("999"), super::parse_font("x")), (16.0, 13.0, 13.0));
     }
     #[test]
     fn colorea_la_linea_de_uso() {
@@ -2318,7 +3049,7 @@ mod tests {
         assert_eq!(r.iter().map(|c| c.2).collect::<String>().trim_end(), "▸▸ auto mode on");
         let mut r3 = mk("▸▸ auto mode on (shift+tab to cycle) · esc to interrupt");
         hide_hint(&mut r3);
-        assert_eq!(r3.iter().map(|c| c.2).collect::<String>().trim_end(), "▸▸ auto mode on · esc to interrupt");
+        assert_eq!(r3.iter().map(|c| c.2).collect::<String>().trim_end(), "▸▸ auto mode on");
         let mut r2 = mk("echo shift+tab");
         hide_hint(&mut r2);
         assert_eq!(r2.iter().map(|c| c.2).collect::<String>(), "echo shift+tab");
@@ -2450,7 +3181,7 @@ mod tests {
         // Ubicación actual, bajo /private/tmp.
         use std::os::unix::fs::MetadataExt;
         let tmp = std::path::PathBuf::from(format!("/private/tmp/claude-{}/mt-test-{}", std::fs::metadata(&d).unwrap().uid(), std::process::id()));
-        let new_id = "0a1b2c3d-1111-4222-8333-999999999999";
+        let new_id = &format!("0a1b2c3d-1111-4222-8333-{:012}", std::process::id());
         std::fs::create_dir_all(tmp.join(new_id).join("images")).unwrap();
         std::fs::write(tmp.join(new_id).join("images/7.png"), "x").unwrap();
         assert_eq!(claude_image_at(&c("[Image #7]"), 3, new_id, ds).map(|h| h.0), Some(tmp.join(new_id).join("images/7.png")));
