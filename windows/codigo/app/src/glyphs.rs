@@ -47,8 +47,37 @@ pub fn cell_rects(c: char, cw: f32, ch: f32) -> Option<Vec<Rc>> {
         0x23F5 => { let (hh, w, cy) = (cw * 0.45, cw * 0.65, ch / 2.0); scan(cy - hh, cy + hh, |dy| ((cw - w) / 2.0, w * (1.0 - dy.abs() / hh)), cy) }
         // ⎿ codo: vertical desde arriba hasta el centro y horizontal hacia la derecha.
         0x23BF => { let (x, y) = ((cw * 0.35).round(), (ch / 2.0).round()); vec![r(x, 0.0, lt, y + lt), r(x, y, cw * 0.85 - x, lt)] }
+        // ✢✳✶✻✽ del indicador de trabajo de Claude: desde una fuente de respaldo miden distinto y la línea salta.
+        0x2722 => star(4, 0.80, lt, cw, ch),
+        0x2733 => star(8, 0.85, lt, cw, ch),
+        0x2736 => star(6, 0.70, lt * 2.0, cw, ch),
+        0x273B => star(8, 1.0, lt * 1.5, cw, ch),
+        0x273D => star(6, 1.0, lt * 2.0, cw, ch),
         _ => return None,
     })
+}
+
+/// Estrella de `n` brazos centrada en la celda; `k` es el largo (1 = todo el ancho) y `t` el grosor.
+fn star(n: u32, k: f32, t: f32, cw: f32, ch: f32) -> Vec<Rc> {
+    let (cx, cy, rad) = (cw / 2.0, ch / 2.0, cw.min(ch) * 0.5 * k);
+    let arms: Vec<(f32, f32)> = (0..n).map(|i| (std::f32::consts::TAU * i as f32 / n as f32 - std::f32::consts::FRAC_PI_2).sin_cos()).collect();
+    let on = |x: f32, y: f32| arms.iter().any(|&(s, c)| {
+        let a = (x * c + y * s).clamp(0.0, rad);
+        (x - a * c).hypot(y - a * s) <= t / 2.0
+    });
+    let mut v = vec![];
+    for j in (cy - rad).floor().max(0.0) as i32..(cy + rad).ceil().min(ch) as i32 {
+        let mut from = None;
+        for i in 0..=cw as i32 {
+            let lit = i < cw as i32 && on(i as f32 + 0.5 - cx, j as f32 + 0.5 - cy);
+            match (lit, from) {
+                (true, None) => from = Some(i),
+                (false, Some(a)) => { v.push([a as f32, j as f32, (i - a) as f32, 1.0, 1.0]); from = None; }
+                _ => {}
+            }
+        }
+    }
+    v
 }
 
 /// Filas de 1 px entre `y0` e `y1`; `f(dy)` da (x, ancho) de la fila a distancia `dy` del centro `cy`.
@@ -130,5 +159,9 @@ mod tests {
         assert!(cell_rects('\u{2800}', CW, CH).unwrap().is_empty());
         assert!(cell_rects('a', CW, CH).is_none());
         for c in ['⏺', '⏵', '⎿'] { assert!(!cell_rects(c, CW, CH).unwrap().is_empty()); }
+        for c in ['✢', '✳', '✶', '✻', '✽'] {
+            let rs = cell_rects(c, CW, CH).unwrap();
+            assert!(!rs.is_empty() && rs.iter().all(|r| r[0] >= 0.0 && r[0] + r[2] <= CW && r[1] >= 0.0 && r[1] + r[3] <= CH), "{c}");
+        }
     }
 }
