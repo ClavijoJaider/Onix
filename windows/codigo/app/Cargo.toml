@@ -1,0 +1,17 @@
+[package]
+name = "onix"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+term-core = { path = "../term-core" }
+winit = "=0.30.13"
+cosmic-text = "=0.19.0"
+softbuffer = "0.4"
+arboard = { version = "3", default-features = false }
+usage = { path = "../usage" }
+chrono = "0.4"
+serde_json = "1"
+rustc-hash = "2"
+sysinfo = "0.37"
+rfd = { version = "0.15", default-features = false }
