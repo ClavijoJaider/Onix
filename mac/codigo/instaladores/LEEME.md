@@ -8,6 +8,8 @@ de Apple: en otro Mac, la primera vez hay que permitirla en Ajustes del Sistema,
 Doble clic. Instala `onix.exe` para tu usuario y crea el acceso directo. Windows puede avisar que el programa
 es desconocido porque no está firmado.
 
+Para actualizar, escribe `onix update` dentro de Onix y vuelve a abrirlo. Baja la última versión publicada aquí.
+
 La versión de Windows usa el mismo código que la de Mac, con PowerShell. Aún está en pruebas.
 
 | Atajo | Acción |

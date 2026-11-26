@@ -23,6 +23,15 @@ foreach ($carpeta in [Environment]::GetFolderPath("Programs"), [Environment]::Ge
 }
 "Onix instalado en $destino, con acceso en el Escritorio y en el menu Inicio."
 
+# Comando "onix update" (en .local\bin, que Onix ya agrega al PATH de sus sesiones).
+if (Test-Path "$PSScriptRoot\actualizar.ps1") {
+    Copy-Item "$PSScriptRoot\actualizar.ps1" $destino -Force
+    $bin = "$env:USERPROFILE\.local\bin"
+    New-Item -ItemType Directory -Force $bin | Out-Null
+    Set-Content "$bin\onix.cmd" -Encoding ASCII -Value '@echo off', 'if /i not "%~1"=="update" (echo Uso: onix update& exit /b 1)', 'powershell -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\Programs\Onix\actualizar.ps1"'
+    "Comando para actualizar: onix update"
+}
+
 # Barras de contexto y uso en Claude Code. No pisa otra linea de estado que ya tengas.
 try {
     Copy-Item "$PSScriptRoot\statusline.ps1" $destino -Force
