@@ -1241,6 +1241,8 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
         for c in &row {
             let mut chr = c.2;
             let mut drawn = false;
+            // El '*' del indicador de trabajo queda alto en Consolas y brinca entre cuadros: va centrado.
+            if chr == '*' && c.0 == 0 && row.get(1).is_some_and(|n| n.2 == ' ') { chr = '✱'; }
             // Cajas, bloques, braille y símbolos: se dibujan como rects y el texto deja un espacio.
             if let Some(rs) = glyphs::cell_rects(chr, cw * c.1 as f32, ch) {
                 let cx = ox + c.0 as f32 * cw;
