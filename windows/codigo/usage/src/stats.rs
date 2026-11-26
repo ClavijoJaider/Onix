@@ -1,5 +1,5 @@
 //! Cifras de la pantalla "Agent usage" a partir de los registros de Claude Code (solo lo medido).
-use crate::{Past, Record, Usage};
+use crate::{Past, Record, Usage, CODEX};
 use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use std::collections::{HashMap, HashSet};
 
@@ -15,9 +15,6 @@ pub struct Totals {
     pub tasks: u64,      // sesiones principales con actividad
     pub secs: i64,       // tiempo de agente (suma por sesión, sin huecos > IDLE_GAP_S)
     pub max_at_once: u64,
-    /// Días tomados del resumen de Claude, y mensajes (los suyos más las respuestas medidas).
-    pub past_days: u64,
-    pub msgs: u64,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -35,9 +32,12 @@ pub struct Stats {
     /// Respuestas por [día de la semana lun=0][hora].
     pub heat: [[u64; 24]; 7],
     pub models: Vec<Row>,
-    /// Primer día con registros detallados (horas y tiempo de agente salen solo de ahí).
-    pub detail_from: Option<NaiveDate>,
+    /// Totales del periodo por agente, sin filtrar: (índice en la lista, cifras). Solo los que tienen datos.
+    pub agents: Vec<(usize, Totals)>,
 }
+
+/// Índice del agente en la lista de la pantalla: 0 Claude Code, 1 Codex.
+pub fn agent_of(r: &Record) -> usize { usize::from(r.session.starts_with(CODEX)) }
 
 fn inp(u: &Usage) -> u64 { u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens }
 
@@ -48,21 +48,20 @@ fn totals(recs: &[&Record], past: &HashMap<NaiveDate, &Past>, from: NaiveDate, t
     let mut by_sess: HashMap<(&str, bool), Vec<i64>> = HashMap::new();
     let mut tasks: HashSet<&str> = HashSet::new();
     for r in recs.iter().filter(|r| r.day >= from && r.day <= to) {
-        if !past.contains_key(&r.day) {
+        if agent_of(r) != 0 || !past.contains_key(&r.day) {
             t.input += inp(&r.usage);
             t.cache_read += r.usage.cache_read_input_tokens;
             t.output += r.usage.output_tokens;
             t.turns += 1;
-            t.msgs += 1;
             tasks.insert(&r.session);
         }
         by_sess.entry((&r.session, r.sub)).or_default().push(r.at.timestamp());
     }
     t.tasks = tasks.len() as u64;
     for p in past.values().filter(|p| p.day >= from && p.day <= to) {
-        t.past_days += 1;
         t.tasks += p.sessions;
-        t.msgs += p.messages;
+        // El resumen no cuenta turnos: valen sus mensajes.
+        t.turns += p.messages;
         for (_, u) in &p.models { t.input += inp(u); t.cache_read += u.cache_read_input_tokens; t.output += u.output_tokens; }
     }
     let mut per_day: HashMap<NaiveDate, i64> = HashMap::new();
@@ -84,33 +83,36 @@ fn totals(recs: &[&Record], past: &HashMap<NaiveDate, &Past>, from: NaiveDate, t
 }
 
 /// Estadísticas de los últimos `days` días hasta `today` (None = todo el historial).
-pub fn compute(records: &[Record], history: &[Past], days: Option<i64>, today: NaiveDate) -> Stats {
-    let recs: Vec<&Record> = records.iter().filter(|r| !r.model.starts_with('<')).collect();
+pub fn compute(records: &[Record], history: &[Past], only: Option<usize>, days: Option<i64>, today: NaiveDate) -> Stats {
+    let all: Vec<&Record> = records.iter().filter(|r| !r.model.starts_with('<')).collect();
+    let recs: Vec<&Record> = all.iter().copied().filter(|r| only.is_none_or(|a| a == agent_of(r))).collect();
     // El resumen manda en los días en que tiene más tokens que los jsonl (ya borrados en parte).
     let mut measured: HashMap<NaiveDate, u64> = HashMap::new();
-    for r in &recs { *measured.entry(r.day).or_default() += r.usage.total(); }
+    for r in all.iter().filter(|r| agent_of(r) == 0) { *measured.entry(r.day).or_default() += r.usage.total(); }
     let past: HashMap<NaiveDate, &Past> = history.iter()
         .filter(|p| p.models.iter().map(|m| m.1.total()).sum::<u64>() > measured.get(&p.day).copied().unwrap_or(0))
         .map(|p| (p.day, p)).collect();
-    let detail_from = recs.iter().map(|r| r.day).min();
-    let first = detail_from.into_iter().chain(past.keys().copied()).min().unwrap_or(today);
+    // El resumen es solo de Claude.
+    let none = HashMap::new();
+    let mine = if only.is_none_or(|a| a == 0) { &past } else { &none };
+    let first = recs.iter().map(|r| r.day).chain(mine.keys().copied()).min().unwrap_or(today);
     let from = days.map_or(first, |n| today - Duration::days(n - 1));
-    let (cur, per_day) = totals(&recs, &past, from, today);
-    let prev = days.map(|n| totals(&recs, &past, from - Duration::days(n), from - Duration::days(1)).0);
+    let (cur, per_day) = totals(&recs, mine, from, today);
+    let prev = days.map(|n| totals(&recs, mine, from - Duration::days(n), from - Duration::days(1)).0);
     let n = (today - from).num_days().max(0) as usize + 1;
     let mut daysv = vec![(0u64, 0u64, 0u64, 0i64); n];
     let mut heat = [[0u64; 24]; 7];
     let mut models: HashMap<&str, (Row, HashSet<&str>)> = HashMap::new();
     for r in recs.iter().filter(|r| r.day >= from && r.day <= today) {
         let d = &mut daysv[(r.day - from).num_days() as usize];
-        let detail = !past.contains_key(&r.day);
+        let detail = agent_of(r) != 0 || !past.contains_key(&r.day);
         if detail { d.0 += inp(&r.usage); d.1 += r.usage.output_tokens; d.2 += 1; }
         heat[r.at.weekday().num_days_from_monday() as usize][r.at.hour() as usize] += 1;
         let m = models.entry(&r.model).or_insert_with(|| (Row { name: r.model.clone(), ..Default::default() }, HashSet::new()));
         if detail { m.0.input += inp(&r.usage); m.0.output += r.usage.output_tokens; }
         m.1.insert(&r.session);
     }
-    for p in past.values().filter(|p| p.day >= from && p.day <= today) {
+    for p in mine.values().filter(|p| p.day >= from && p.day <= today) {
         let d = &mut daysv[(p.day - from).num_days() as usize];
         d.2 += p.messages.max(1);
         for (name, u) in &p.models {
@@ -124,7 +126,12 @@ pub fn compute(records: &[Record], history: &[Past], days: Option<i64>, today: N
     for (day, s) in per_day { if day >= from && day <= today { daysv[(day - from).num_days() as usize].3 += s; } }
     let mut models: Vec<Row> = models.into_values().map(|(mut r, s)| { r.tasks = s.len() as u64; r }).collect();
     models.sort_by(|a, b| (b.input + b.output).cmp(&(a.input + a.output)).then(a.name.cmp(&b.name)));
-    Stats { from, to: today, cur, prev, days: daysv, heat, models, detail_from }
+    let agents = (0..2).filter_map(|a| {
+        let theirs: Vec<&Record> = all.iter().copied().filter(|r| agent_of(r) == a).collect();
+        let t = totals(&theirs, if a == 0 { &past } else { &none }, from, today).0;
+        (t.turns > 0).then_some((a, t))
+    }).collect();
+    Stats { from, to: today, cur, prev, days: daysv, heat, models, agents }
 }
 
 /// Cambio porcentual redondeado (None si no hay base).
@@ -180,7 +187,7 @@ mod tests {
             rec(20, 9, 0, "c", "claude-opus-5-5", 7, 7), rec(10, 9, 0, "d", "claude-opus-5-5", 1000, 1000),
             rec(24, 11, 0, "e", "<synthetic>", 9, 9),
         ];
-        let s = compute(&r, &[], Some(7), today);
+        let s = compute(&r, &[], None, Some(7), today);
         assert_eq!(s.from, NaiveDate::from_ymd_opt(2026, 11, 18).unwrap());
         assert_eq!((s.cur.input, s.cur.output, s.cur.turns, s.cur.tasks), (258, 33, 5, 3));
         // a: 10:00→10:05 cuenta 300 s; 10:05→10:30 es hueco > 10 min.
@@ -191,7 +198,7 @@ mod tests {
         assert_eq!(s.models[0].name, "claude-opus-5-5");
         assert_eq!(s.models[0].tasks, 2);
         assert_eq!(s.prev.as_ref().unwrap().turns, 0);
-        let all = compute(&r, &[], None, today);
+        let all = compute(&r, &[], None, None, today);
         assert_eq!(all.cur.turns, 6);
         assert!(all.prev.is_none());
     }
@@ -202,9 +209,16 @@ mod tests {
             "modelUsage":{"claude-opus-5-5":{"inputTokens":10,"outputTokens":10,"cacheReadInputTokens":70,"cacheCreationInputTokens":10}}}"#);
         let today = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
         // El 24 hay más tokens medidos que en el resumen: mandan los registros.
-        let s = compute(&[rec(24, 10, 0, "a", "claude-opus-5-5", 100, 10)], &past, Some(7), today);
+        let s = compute(&[rec(24, 10, 0, "a", "claude-opus-5-5", 100, 10)], &past, None, Some(7), today);
         assert_eq!((s.cur.input, s.cur.output, s.cur.cache_read), (1000, 110, 700));
-        assert_eq!((s.cur.tasks, s.cur.msgs, s.cur.turns, s.cur.past_days), (4, 41, 1, 1));
+        assert_eq!((s.cur.tasks, s.cur.turns), (4, 41));
+        // Codex cuenta aparte: no tapa el resumen de Claude y se puede filtrar.
+        let both = [rec(20, 10, 0, "codex:x", "gpt-6-luna", 5000, 7)];
+        let s = compute(&both, &past, None, Some(7), today);
+        assert_eq!((s.cur.output, s.agents.len()), (107, 2));
+        let s = compute(&both, &past, Some(1), Some(7), today);
+        assert_eq!((s.cur.input, s.cur.output, s.models.len(), s.agents.len()), (5000, 7, 1, 2));
+        let s = compute(&[rec(24, 10, 0, "a", "claude-opus-5-5", 100, 10)], &past, None, Some(7), today);
         assert_eq!((s.models.len(), s.models[0].input + s.models[0].output), (1, 1110));
         assert!(crate::history("no es json").is_empty());
     }

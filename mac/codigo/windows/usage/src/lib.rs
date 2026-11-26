@@ -101,6 +101,9 @@ pub fn history(json: &str) -> Vec<Past> {
     }).collect()
 }
 
+/// Prefijo de sesión de los registros de Codex.
+pub const CODEX: &str = "codex:";
+
 #[derive(Default)]
 pub struct Scan {
     pub records: HashMap<String, Record>,
@@ -111,6 +114,35 @@ pub struct Scan {
 }
 
 impl Scan {
+    /// Sesiones de Codex (`~/.codex/sessions`): el modelo viene en `turn_context` y cada
+    /// `token_count` trae lo gastado en esa respuesta y el acumulado (sirve para no repetir).
+    pub fn scan_codex(&mut self, root: &Path) {
+        for e in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if e.path().extension().is_none_or(|x| x != "jsonl") { continue; }
+            let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+            let session = format!("{CODEX}{}", e.path().file_stem().unwrap_or_default().to_string_lossy());
+            let (mut model, mut project) = (String::from("?"), String::from("?"));
+            for line in text.lines() {
+                if !line.contains("turn_context") && !line.contains("token_count") { continue; }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { self.invalid += 1; continue };
+                let p = &v["payload"];
+                if v["type"] == "turn_context" {
+                    if let Some(m) = p["model"].as_str() { model = m.into(); }
+                    if let Some(c) = p["cwd"].as_str() { project = c.into(); }
+                    continue;
+                }
+                let (last, total) = (&p["info"]["last_token_usage"], &p["info"]["total_token_usage"]["total_tokens"]);
+                let Some(t) = v["timestamp"].as_str().and_then(|t| DateTime::parse_from_rfc3339(t).ok()) else { continue };
+                if last.is_null() { continue; }
+                let n = |k: &str| last[k].as_u64().unwrap_or(0);
+                let (read, write) = (n("cached_input_tokens"), n("cache_write_input_tokens"));
+                let usage = Usage { input_tokens: n("input_tokens").saturating_sub(read + write), output_tokens: n("output_tokens"), cache_read_input_tokens: read, cache_creation_input_tokens: write };
+                let at = t.with_timezone(&Local);
+                self.records.entry(format!("{session}#{total}")).or_insert_with(|| Record { day: at.date_naive(), at, session: session.clone(), sub: false, model: model.clone(), project: project.clone(), usage });
+            }
+        }
+    }
+
     /// Procesa una línea; las que no son de asistente con usage se ignoran.
     pub fn feed(&mut self, line: &str) {
         if !line.contains("\"usage\"") {

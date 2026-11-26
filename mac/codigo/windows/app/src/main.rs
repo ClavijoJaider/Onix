@@ -806,6 +806,7 @@ const CHROME_PX: f32 = 16.0;
 type Ovl = (R, Vec<(R, Rgb)>, Vec<usage_view::Txt>, Vec<usage_view::Logo>);
 
 fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), side: &sb::Side, mt: f32, ovl: Option<Ovl>, link: Option<&Link>, sk: &skills::Ui) -> bool {
+    let usage_open = ovl.is_some();
     let bm = g.bar_metrics();
     let tabs_len = tabs.len();
     let sz = (g.w as f32, g.h as f32);
@@ -1404,7 +1405,8 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
     let ologos: Vec<([CustomGlyph; 1], f32, f32)> = ovl.iter().flat_map(|o| &o.3).filter_map(|&((x, y, w, _), i)| {
         use sb::Agent::*;
         let a = [Claude, Codex, Antigravity, Opencode, Grok, Junie][i];
-        let c = a.color();
+        // Junie va en su verde, como en la referencia.
+        let c = if a == Junie { [0x3d, 0xd6, 0x5a] } else { a.color() };
         Some((lg(a.icon()?.0, w, 0.0, 0.0, Color::rgb(c[0], c[1], c[2])), x, y))
     }).collect();
     if let (Some((_, _, otx, _)), Some(ob)) = (&ovl, ob) {
@@ -1447,7 +1449,7 @@ fn draw(g: &mut Gfx, tabs: &mut [Tab], active_tab: usize, mouse: (f32, f32), sid
         g.frame.text(std::iter::once(TextArea { buffer: b, left: x + 12.0 * sc, top: y + 6.0 * sc, bounds,
             default_color: Color::rgb(0xd4, 0xd4, 0xd4), custom_glyphs: &[] }), &mut g.fs, &mut g.sc);
     }
-    if let Some(spot) = tabs[active_tab].panes[tabs[active_tab].active].spot { paint_skills(g, sk, spot, mouse); }
+    if let Some(spot) = tabs[active_tab].panes[tabs[active_tab].active].spot.filter(|_| !usage_open) { paint_skills(g, sk, spot, mouse); }
     if let Some((rows, hi)) = &g.pal {
         let sc = g.scale;
         let (x, y, w, rh) = palette::geom(g.w as f32, sc, bm.line_height);
@@ -1589,6 +1591,13 @@ fn init_gfx(el: &ActiveEventLoop) -> Gfx {
     let [_, _, ww, wh] = saved.unwrap_or([0.0, 0.0, 960.0, 600.0]);
     let mut attrs = Window::default_attributes()
         .with_inner_size(LogicalSize::new(ww, wh)).with_title("Ónix");
+    // Ícono de la barra de título y de la barra de tareas: el recurso 1 del .exe.
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+        let icon = |n| winit::window::Icon::from_resource(1, Some(winit::dpi::PhysicalSize::new(n, n))).ok();
+        attrs = attrs.with_window_icon(icon(32)).with_taskbar_icon(icon(256));
+    }
     // La posición solo se restaura si cae en un monitor conectado ahora.
     if let Some([x, y, ..]) = saved {
         let visible = el.available_monitors().any(|m| {
@@ -2217,6 +2226,7 @@ impl App {
     }
     /// Dónde van los puntos en el panel activo (None: no es Claude, no hay cuadro o el texto llega hasta ahí).
     fn spot(&self) -> Option<R> {
+        if self.uv.open { return None; }
         let t = self.tabs.get(self.active_tab)?;
         t.panes[t.active].spot
     }
@@ -2546,8 +2556,8 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 let mt = self.mq.1.elapsed().as_secs_f32();
                 // Redibujo continuo solo mientras el carrusel está activo (hover sobre título largo).
                 let ovl = if self.uv.open {
-                    let (a, sc, m, range) = (self.area(), self.g.as_ref().unwrap().scale, self.mouse, self.uv.range);
-                    let (rs, tx, lo) = usage_view::build(a, sc, self.uv.stats(), range, m);
+                    let (a, sc, m, range, agent) = (self.area(), self.g.as_ref().unwrap().scale, self.mouse, self.uv.range, self.uv.agent);
+                    let (rs, tx, lo) = usage_view::build(a, sc, self.uv.stats(), range, agent, m);
                     Some((a, rs, tx, lo))
                 } else { None };
                 let t0 = Instant::now();
@@ -2825,15 +2835,17 @@ impl winit::application::ApplicationHandler<Ev> for App {
                 if inside(bar_btn(wpx, sc, BTN_PULSE), self.mouse) { self.toggle_list(0); return; }
                 if inside(bar_btn(wpx, sc, BTN_ROBOT), self.mouse) { self.toggle_agents(); return; }
                 if inside(bar_btn(wpx, sc, BTN_GLOBE), self.mouse) { self.toggle_list(1); return; }
-                { if self.column().iter().any(|r| r.is_some_and(|r| inside(r, self.mouse))) { self.col_click(); return; } }
                 if self.uv.open && inside(self.area(), self.mouse) {
                     match usage_view::hit_at(self.area(), sc, self.mouse) {
                         Some(usage_view::Hit::Close) => self.toggle_usage(),
                         Some(usage_view::Hit::Range(i)) => { self.uv.range = i; self.redraw(); }
+                        // Otro clic en el mismo agente quita el filtro.
+                        Some(usage_view::Hit::Agent(i)) => { self.uv.agent = (self.uv.agent != Some(i)).then_some(i); self.redraw(); }
                         None => {}
                     }
                     return;
                 }
+                { if self.column().iter().any(|r| r.is_some_and(|r| inside(r, self.mouse))) { self.col_click(); return; } }
                 if self.side.visible && self.mouse.0 < sb::SIDE_W * sc { self.side.col_focus = false; self.side_click(); return; }
                 self.side.focus = false;
                 self.side.col_focus = false;
