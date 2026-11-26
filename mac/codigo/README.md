@@ -16,6 +16,15 @@ cd Onix
 scripts/build-app.sh
 ```
 
+Para tener el comando de actualización, desde `mac/codigo`:
+
+```bash
+ln -s "$PWD/scripts/onix" ~/.local/bin/onix
+onix update
+```
+
+`onix update` trae lo último de GitHub, compila e instala.
+
 La app queda en `~/Applications/Onix.app`. El resultado de la compilación se guarda en `~/Library/Logs/mi-terminal-build.log`.
 
 ## Imágenes, archivos y rutas

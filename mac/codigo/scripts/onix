@@ -1,0 +1,16 @@
+#!/bin/bash
+# `onix update`: trae lo último de GitHub, compila e instala la app.
+set -eu
+[ "${1:-}" = update ] || { echo "Uso: onix update"; exit 1; }
+SELF="$(readlink "$0" || echo "$0")"   # se llama desde un enlace en ~/.local/bin
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+STATE="$HOME/.cache/mi-terminal-autobuild"
+export CARGO_TARGET_DIR="$STATE/target"   # fuera de la carpeta del proyecto
+. "$ROOT/scripts/fingerprint.sh"
+git -C "$ROOT" pull --ff-only
+if [ -d "$HOME/Applications/Onix.app" ] && [ "$(fingerprint "$ROOT")" = "$(cat "$STATE/last-fingerprint" 2>/dev/null)" ]; then
+  echo "Onix ya está al día."; exit 0
+fi
+echo "Compilando Onix (la primera vez tarda unos minutos)…"
+"$ROOT/scripts/build-app.sh" || { echo "Falló; tu Onix sigue igual. Detalle: ~/Library/Logs/mi-terminal-build.log"; exit 1; }
+echo "Listo. Cierra y vuelve a abrir Onix."
